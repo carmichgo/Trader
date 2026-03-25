@@ -14,6 +14,7 @@ import structlog
 from packages.core.ai.client import AIClient
 from packages.core.ai.cost_tracker import CostTracker
 from packages.core.base_trader import BaseTrader
+from packages.core.db.supabase_client import SupabaseDB
 from packages.core.config import SystemConfig
 from packages.core.execution.order_manager import OrderManager
 from packages.core.models import (
@@ -319,6 +320,9 @@ async def run_stock_trader(
         is_paper_trading=(trader_config.mode == "paper"),
     )
 
+    # --- Supabase persistence ---
+    supabase_db = SupabaseDB()
+
     # --- Assemble trader ---
     trader = StockTrader(
         market_feed=market_feed,
@@ -338,6 +342,7 @@ async def run_stock_trader(
         frequency_limiter=frequency_limiter,
         pace_monitor=pace_monitor,
         portfolio=portfolio,
+        supabase_db=supabase_db,
     )
 
     logger.info(

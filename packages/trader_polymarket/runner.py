@@ -348,6 +348,7 @@ async def run_polymarket_trader(
         frequency_limiter=frequency_limiter,
         pace_monitor=pace_monitor,
         portfolio=portfolio,
+        supabase_db=supabase_db,
     )
 
     logger.info(
