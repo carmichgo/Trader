@@ -142,7 +142,7 @@ const COIN_SYMBOLS: Record<string, string> = {
   binancecoin: 'BNB',
 };
 
-const SCREENER_SYSTEM_PROMPT = `You are a crypto market screener AI. Analyze the provided market data and identify trading opportunities.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener AI. Analyze the provided market data and identify trading opportunities.
 
 Respond ONLY with a JSON array of opportunities. Each object must have:
 - asset: string (ticker symbol)
@@ -283,6 +283,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // Load latest strategist plan
+    const { data: plans } = await supabase
+      .from('strategist_plans')
+      .select('trader_configs, allocations, daily_target, risk_posture')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const plan = plans?.[0] as Record<string, unknown> | undefined;
+    const directives = (plan?.trader_configs as Record<string, unknown>)?.crypto as {
+      enabled?: boolean;
+      max_position_pct?: number;
+      confidence_threshold?: number;
+      focus_assets?: string[];
+      strategy_notes?: string;
+    } | undefined;
+
+    // Skip if strategist disabled this trader
+    if (directives && directives.enabled === false) {
+      return res.status(200).json({
+        ...result,
+        errors: ['Crypto trader disabled by strategist'],
+      });
+    }
+
     // 1. Fetch market data
     let markets: MarketData[];
     try {
@@ -293,10 +316,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const snapshot = buildMarketSnapshot(markets);
 
-    // 2. Screen with Sonnet (cost: ~$0.005)
+    // 2. Build screener prompt with strategist directives
+    const strategistContext = directives
+      ? `\n\nSTRATEGIST DIRECTIVES:
+- Risk posture: ${plan?.risk_posture ?? 'moderate'}
+- Confidence threshold: ${directives.confidence_threshold ?? 70} (only flag opportunities scoring above this)
+- Focus assets: ${directives.focus_assets?.join(', ') ?? 'any'}
+- Strategy notes: ${directives.strategy_notes ?? 'none'}
+- Daily P&L target: $${plan?.daily_target ?? 0}`
+      : '';
+
+    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT_BASE + strategistContext;
+
     const screenerResponse = await callClaude(
       SONNET,
-      SCREENER_SYSTEM_PROMPT,
+      screenerSystemPrompt,
       `Analyze this market data and identify trading opportunities. Be very selective — only flag strong setups.\n\n${snapshot}`,
       1024
     );
@@ -322,11 +356,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Filter for high confidence
-    const viable = opportunities.filter((o) => o.score >= 70);
+    // Filter for high confidence using strategist threshold
+    const minScore = directives?.confidence_threshold ?? 70;
+    const viable = opportunities.filter((o) => o.score >= minScore);
     result.opportunities_found = viable.length;
 
-    // 3. Only deep-analyze VERY high-scoring opportunities (saves cost)
+    // 3. Only deep-analyze high-scoring opportunities (saves cost)
+    const analystThreshold = directives?.confidence_threshold
+      ? Math.max(directives.confidence_threshold, ANALYST_THRESHOLD)
+      : ANALYST_THRESHOLD;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded
@@ -334,7 +372,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         result.errors.push(`Near daily cap ($${updatedDailyCost.toFixed(4)}), skipping analyst for ${opp.asset}`);
         continue;
       }
-      if (opp.score < ANALYST_THRESHOLD) continue;
+      if (opp.score < analystThreshold) continue;
 
       const marketItem = markets.find((m) => m.symbol === opp.asset);
       const analystPrompt = `Trading opportunity:

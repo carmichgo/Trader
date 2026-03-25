@@ -93,109 +93,206 @@ function extractJSON<T = unknown>(raw: string): T {
 
 // ── Strategist logic ──
 
-const OPUS = 'claude-opus-4-20250514';
+const SONNET = 'claude-sonnet-4-20250514';
 const TRADER_NAME = 'strategist';
 
 interface StrategistPlan {
   allocations: {
-    crypto_pct: number;
-    stocks_pct: number;
-    polymarket_pct: number;
-    cash_pct: number;
+    crypto: number;
+    stocks: number;
+    polymarket: number;
+    cash: number;
   };
-  risk_level: 'conservative' | 'moderate' | 'aggressive';
-  daily_trade_limit: number;
-  max_position_size_pct: number;
-  focus_assets: string[];
-  stop_loss_default_pct: number;
-  take_profit_default_pct: number;
+  risk_posture: 'aggressive' | 'moderate' | 'conservative' | 'defensive';
+  daily_pnl_target_usd: number;
+
+  trader_directives: {
+    crypto: {
+      enabled: boolean;
+      max_position_pct: number;
+      confidence_threshold: number;
+      focus_assets: string[];
+      strategy_notes: string;
+    };
+    stocks: {
+      enabled: boolean;
+      max_position_pct: number;
+      confidence_threshold: number;
+      focus_assets: string[];
+      strategy_notes: string;
+    };
+    polymarket: {
+      enabled: boolean;
+      max_position_pct: number;
+      confidence_threshold: number;
+      max_event_horizon_days: number;
+      focus_categories: string[];
+      strategy_notes: string;
+    };
+  };
+
   reasoning: string;
+  goal_feasibility: 'on_track' | 'at_risk' | 'unreachable';
 }
 
-const STRATEGIST_SYSTEM_PROMPT = `You are the chief strategist AI for an autonomous paper-trading system.
-Your job is to review overall performance and set the daily trading plan including capital allocation.
+const STRATEGIST_SYSTEM_PROMPT = `You are the chief strategist AI for a goal-driven autonomous paper-trading system.
 
-The system trades across three markets: crypto, US stocks, and Polymarket prediction markets.
-Total paper capital is approximately $1,000.
+Your role is the META-BRAIN: you set the daily plan that ALL downstream traders must follow exactly. You do NOT trade yourself — you direct three trader agents (crypto, stocks, polymarket) by issuing specific directives.
 
-Respond ONLY with a JSON object:
-- allocations: { crypto_pct: number, stocks_pct: number, polymarket_pct: number, cash_pct: number }
-  (must sum to 100)
-- risk_level: "conservative" | "moderate" | "aggressive"
-- daily_trade_limit: number (max trades per day across all traders)
-- max_position_size_pct: number (max % of capital in any single trade)
-- focus_assets: string[] (up to 5 tickers or markets to prioritize today)
-- stop_loss_default_pct: number (default stop loss percentage)
-- take_profit_default_pct: number (default take profit percentage)
-- reasoning: string (explain your strategy for today)`;
+THE HIERARCHY:
+  Goal (dollar target + time horizon) → You (Strategist) → Trader Configs → Screener Prompts
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+KEY PRINCIPLES:
+1. Every decision flows from the GOAL. If the goal says "turn $1,000 into $1,500 in 30 days", that implies ~1.4% daily return, which requires aggressive but not reckless positioning.
+2. You must calculate feasibility. If the math is impossible (e.g. 50% daily returns needed), say so and set defensive posture.
+3. Risk posture is derived from goal progress: ahead of pace → conservative, behind pace → more aggressive, far behind → assess if still feasible.
+4. TIME HORIZON matters for every market:
+   - Crypto: volatile, can generate returns quickly, but also large drawdowns
+   - Stocks: lower volatility, more predictable, needs market hours
+   - Polymarket: CRITICAL — only trade events that will RESOLVE within the goal's remaining time horizon. If you have 30 days left, do NOT bet on events resolving in 6 months.
+5. For Polymarket specifically: set max_event_horizon_days to roughly match the goal's remaining days. This prevents capital from being locked in long-dated bets that cannot contribute to the goal.
+
+Respond ONLY with a JSON object matching this exact structure:
+{
+  "allocations": {
+    "crypto": <number 0-100>,
+    "stocks": <number 0-100>,
+    "polymarket": <number 0-100>,
+    "cash": <number 0-100>
+  },
+  "risk_posture": "aggressive" | "moderate" | "conservative" | "defensive",
+  "daily_pnl_target_usd": <number>,
+  "trader_directives": {
+    "crypto": {
+      "enabled": <boolean>,
+      "max_position_pct": <number, max % of crypto allocation in any single trade>,
+      "confidence_threshold": <number 0-100, minimum screener score to trade>,
+      "focus_assets": [<string ticker symbols to prioritize>],
+      "strategy_notes": "<specific guidance for the crypto trader>"
+    },
+    "stocks": {
+      "enabled": <boolean>,
+      "max_position_pct": <number>,
+      "confidence_threshold": <number 0-100>,
+      "focus_assets": [<string ticker symbols>],
+      "strategy_notes": "<specific guidance for the stocks trader>"
+    },
+    "polymarket": {
+      "enabled": <boolean>,
+      "max_position_pct": <number>,
+      "confidence_threshold": <number 0-100>,
+      "max_event_horizon_days": <number, only trade events resolving within this many days>,
+      "focus_categories": [<string categories like "politics", "crypto", "sports">],
+      "strategy_notes": "<specific guidance for the polymarket trader>"
+    }
+  },
+  "reasoning": "<explain your overall strategy and how it connects to the goal>",
+  "goal_feasibility": "on_track" | "at_risk" | "unreachable"
+}
+
+The allocations must sum to 100. Be specific and actionable in your directives — the traders will follow them literally.`;
+
+export async function runStrategist(): Promise<{
+  trader: string;
+  timestamp: string;
+  success: boolean;
+  plan?: StrategistPlan;
+  ai_cost?: number;
+  errors: string[];
+}> {
   const timestamp = new Date().toISOString();
   const errors: string[] = [];
 
-  try {
-    const cronSecret = process.env.CRON_SECRET;
-    if (cronSecret) {
-      const authHeader = req.headers['authorization'];
-      if (authHeader !== `Bearer ${cronSecret}`) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-    }
+  // 1. Fetch active goal
+  const { data: goals } = await supabase
+    .from('goals')
+    .select('*')
+    .eq('is_active', true)
+    .order('created_at', { ascending: false })
+    .limit(1);
 
-    // 1. Fetch current goal
-    const { data: goals } = await supabase
-      .from('goals')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1);
+  const currentGoal = goals?.[0] ?? null;
 
-    const currentGoal = goals?.[0] ?? null;
+  // Calculate goal metrics
+  let daysElapsed = 0;
+  let daysRemaining = 0;
+  let requiredDailyReturn = 0;
+  let currentCapital = 0;
+  let goalId: string | null = null;
 
-    // 2. Fetch recent performance (last 7 days)
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  if (currentGoal) {
+    goalId = currentGoal.id;
+    const startDate = new Date(currentGoal.start_date as string);
+    const now = new Date();
+    daysElapsed = Math.max(0, Math.floor((now.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
+    daysRemaining = Math.max(0, (currentGoal.time_horizon_days as number) - daysElapsed);
+  }
 
-    const { data: recentPerformance } = await supabase
-      .from('daily_performance')
-      .select('*')
-      .gte('date', sevenDaysAgo.split('T')[0])
-      .order('date', { ascending: false });
+  // 2. Fetch latest portfolio snapshot for current capital
+  const { data: snapshots } = await supabase
+    .from('portfolio_snapshots')
+    .select('*')
+    .order('time', { ascending: false })
+    .limit(1);
 
-    // 3. Fetch latest portfolio snapshot
-    const { data: snapshots } = await supabase
-      .from('portfolio_snapshots')
-      .select('*')
-      .order('time', { ascending: false })
-      .limit(1);
+  const latestSnapshot = snapshots?.[0] ?? null;
+  currentCapital = (latestSnapshot?.total_capital as number) ?? (currentGoal?.starting_capital as number) ?? 1000;
 
-    const latestSnapshot = snapshots?.[0] ?? null;
+  if (currentGoal && daysRemaining > 0) {
+    const remainingPnl = (currentGoal.target_capital as number) - currentCapital;
+    requiredDailyReturn = remainingPnl / daysRemaining;
+  }
 
-    // 4. Fetch recent trades summary
-    const { data: recentTrades } = await supabase
-      .from('trades')
-      .select('trader, status, pnl_usd, total_cost')
-      .gte('opened_at', sevenDaysAgo)
-      .order('opened_at', { ascending: false })
-      .limit(50);
+  // 3. Fetch recent performance (last 7 days)
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    // Build context for the strategist
-    const userPrompt = `Today is ${new Date().toISOString().split('T')[0]}.
+  const { data: recentPerformance } = await supabase
+    .from('daily_performance')
+    .select('*')
+    .gte('date', sevenDaysAgo.split('T')[0])
+    .order('date', { ascending: false });
 
-CURRENT GOAL:
-${currentGoal ? `Target: ${currentGoal.target_amount ?? 'N/A'} | Deadline: ${currentGoal.deadline ?? 'N/A'} | Description: ${currentGoal.description ?? 'N/A'}` : 'No goal set.'}
+  // 4. Fetch recent trades summary
+  const { data: recentTrades } = await supabase
+    .from('trades')
+    .select('trader, status, pnl_usd, total_cost')
+    .gte('opened_at', sevenDaysAgo)
+    .order('opened_at', { ascending: false })
+    .limit(50);
 
-RECENT PERFORMANCE (last 7 days):
+  // Build comprehensive context for the strategist
+  const userPrompt = `Today is ${new Date().toISOString().split('T')[0]}.
+
+═══ GOAL ═══
+${currentGoal
+  ? `Starting Capital: $${currentGoal.starting_capital}
+Target Capital: $${currentGoal.target_capital}
+Time Horizon: ${currentGoal.time_horizon_days} days
+Start Date: ${currentGoal.start_date}
+Days Elapsed: ${daysElapsed}
+Days Remaining: ${daysRemaining}
+Current Capital: $${currentCapital.toFixed(2)}
+Required Daily P&L to Hit Target: $${requiredDailyReturn.toFixed(2)}/day
+Required Daily Return: ${currentCapital > 0 ? ((requiredDailyReturn / currentCapital) * 100).toFixed(2) : '0'}%`
+  : 'No active goal set. Use moderate defaults.'}
+
+═══ CURRENT PORTFOLIO ═══
+${latestSnapshot
+  ? `Total Capital: $${latestSnapshot.total_capital ?? 'N/A'}
+Crypto: $${latestSnapshot.crypto_capital ?? 0}
+Stocks: $${latestSnapshot.stocks_capital ?? 0}
+Polymarket: $${latestSnapshot.polymarket_capital ?? 0}
+Cash: $${latestSnapshot.cash ?? 0}`
+  : 'No portfolio snapshot available.'}
+
+═══ RECENT PERFORMANCE (last 7 days) ═══
 ${recentPerformance && recentPerformance.length > 0
   ? recentPerformance.map((p: Record<string, unknown>) =>
       `${p.date}: PnL=$${Number(p.total_pnl ?? 0).toFixed(2)} | Trades=${p.total_trades ?? 0} | Win Rate=${p.win_rate ? (Number(p.win_rate) * 100).toFixed(0) + '%' : 'N/A'} | AI Cost=$${Number(p.ai_cost ?? 0).toFixed(4)}`
     ).join('\n')
   : 'No performance data available yet.'}
 
-CURRENT PORTFOLIO:
-${latestSnapshot
-  ? `Total Capital: $${latestSnapshot.total_capital ?? 'N/A'} | Crypto: $${latestSnapshot.crypto_capital ?? 0} | Stocks: $${latestSnapshot.stocks_capital ?? 0} | Polymarket: $${latestSnapshot.polymarket_capital ?? 0} | Cash: $${latestSnapshot.cash ?? 0}`
-  : 'No portfolio snapshot available.'}
-
-RECENT TRADES SUMMARY:
+═══ RECENT TRADES BY TRADER ═══
 ${recentTrades && recentTrades.length > 0
   ? (() => {
       const byTrader: Record<string, { count: number; pnl: number; cost: number }> = {};
@@ -212,101 +309,120 @@ ${recentTrades && recentTrades.length > 0
     })()
   : 'No recent trades.'}
 
-Based on the above data, create today's trading plan with capital allocations and strategy.`;
+Based on the goal and current state, create the trading plan with per-trader directives. Remember:
+- Polymarket max_event_horizon_days should be <= days_remaining (${daysRemaining} days)
+- If required daily return is unrealistic (>5%), set goal_feasibility to "unreachable" and go defensive
+- Be specific in strategy_notes for each trader`;
 
-    // 5. Call Claude Opus
-    const response = await callClaude(OPUS, STRATEGIST_SYSTEM_PROMPT, userPrompt, 4096);
+  // 5. Call Claude Sonnet (NOT Opus — cost efficiency)
+  const response = await callClaude(SONNET, STRATEGIST_SYSTEM_PROMPT, userPrompt, 4096);
 
-    // Log AI decision
-    await supabase.from('ai_decisions').insert({
-      decision_type: 'strategist',
-      trader: TRADER_NAME,
-      model: OPUS,
-      prompt_tokens: response.input_tokens,
-      completion_tokens: response.output_tokens,
-      cost_usd: response.cost_usd,
-      latency_ms: response.latency_ms,
-      input_summary: userPrompt.slice(0, 500),
-      output_raw: response.content,
-    });
+  // Log AI decision
+  await supabase.from('ai_decisions').insert({
+    decision_type: 'strategist',
+    trader: TRADER_NAME,
+    model: SONNET,
+    prompt_tokens: response.input_tokens,
+    completion_tokens: response.output_tokens,
+    cost_usd: response.cost_usd,
+    latency_ms: response.latency_ms,
+    input_summary: userPrompt.slice(0, 500),
+    output_raw: response.content,
+  });
 
-    // 6. Parse the plan
-    let plan: StrategistPlan;
-    try {
-      plan = extractJSON<StrategistPlan>(response.content);
-    } catch {
-      errors.push('Failed to parse strategist plan JSON');
-      return res.status(200).json({
-        trader: TRADER_NAME,
-        timestamp,
-        success: false,
-        errors,
-        raw_response: response.content.slice(0, 500),
-      });
-    }
-
-    // Validate allocations sum to 100
-    const totalAlloc =
-      plan.allocations.crypto_pct +
-      plan.allocations.stocks_pct +
-      plan.allocations.polymarket_pct +
-      plan.allocations.cash_pct;
-
-    if (Math.abs(totalAlloc - 100) > 1) {
-      errors.push(`Allocations sum to ${totalAlloc}, not 100 — normalizing`);
-      const factor = 100 / totalAlloc;
-      plan.allocations.crypto_pct *= factor;
-      plan.allocations.stocks_pct *= factor;
-      plan.allocations.polymarket_pct *= factor;
-      plan.allocations.cash_pct *= factor;
-    }
-
-    // 7. Insert the plan
-    const { error: planError } = await supabase.from('strategist_plans').insert({
-      date: new Date().toISOString().split('T')[0],
-      allocations: plan.allocations,
-      risk_level: plan.risk_level,
-      daily_trade_limit: plan.daily_trade_limit,
-      max_position_size_pct: plan.max_position_size_pct,
-      focus_assets: plan.focus_assets,
-      stop_loss_default_pct: plan.stop_loss_default_pct,
-      take_profit_default_pct: plan.take_profit_default_pct,
-      reasoning: plan.reasoning,
-      model: OPUS,
-      cost_usd: response.cost_usd,
-    });
-
-    if (planError) {
-      errors.push(`Failed to insert strategist plan: ${planError.message}`);
-    }
-
-    // 8. Insert portfolio snapshot
-    const totalCapital = latestSnapshot?.total_capital ?? 1000;
-    await supabase.from('portfolio_snapshots').insert({
-      time: new Date().toISOString(),
-      crypto_capital: (plan.allocations.crypto_pct / 100) * totalCapital,
-      stocks_capital: (plan.allocations.stocks_pct / 100) * totalCapital,
-      polymarket_capital: (plan.allocations.polymarket_pct / 100) * totalCapital,
-      cash: (plan.allocations.cash_pct / 100) * totalCapital,
-      total_capital: totalCapital,
-      daily_inference_cost: response.cost_usd,
-    });
-
-    return res.status(200).json({
-      trader: TRADER_NAME,
-      timestamp,
-      success: true,
-      plan,
-      ai_cost: response.cost_usd,
-      errors,
-    });
-  } catch (err) {
-    errors.push(String(err));
-    return res.status(500).json({
+  // 6. Parse the plan
+  let plan: StrategistPlan;
+  try {
+    plan = extractJSON<StrategistPlan>(response.content);
+  } catch {
+    errors.push('Failed to parse strategist plan JSON');
+    return {
       trader: TRADER_NAME,
       timestamp,
       success: false,
       errors,
+    };
+  }
+
+  // Validate allocations sum to 100
+  const totalAlloc =
+    plan.allocations.crypto +
+    plan.allocations.stocks +
+    plan.allocations.polymarket +
+    plan.allocations.cash;
+
+  if (Math.abs(totalAlloc - 100) > 1) {
+    errors.push(`Allocations sum to ${totalAlloc}, not 100 — normalizing`);
+    const factor = 100 / totalAlloc;
+    plan.allocations.crypto *= factor;
+    plan.allocations.stocks *= factor;
+    plan.allocations.polymarket *= factor;
+    plan.allocations.cash *= factor;
+  }
+
+  // 7. Insert the strategist plan with new schema
+  const { error: planError } = await supabase.from('strategist_plans').insert({
+    goal_id: goalId,
+    plan_date: new Date().toISOString().split('T')[0],
+    allocations: plan.allocations,
+    trader_configs: plan.trader_directives,
+    risk_posture: plan.risk_posture,
+    daily_target: plan.daily_pnl_target_usd,
+    reasoning: plan.reasoning,
+    goal_feasibility: plan.goal_feasibility,
+    model: SONNET,
+    inference_cost: response.cost_usd,
+    tokens_in: response.input_tokens,
+    tokens_out: response.output_tokens,
+    // Keep backward compat fields
+    date: new Date().toISOString().split('T')[0],
+    cost_usd: response.cost_usd,
+  });
+
+  if (planError) {
+    errors.push(`Failed to insert strategist plan: ${planError.message}`);
+  }
+
+  // 8. Insert portfolio snapshot with allocation-based capitals
+  const totalCapital = currentCapital;
+  await supabase.from('portfolio_snapshots').insert({
+    time: new Date().toISOString(),
+    crypto_capital: (plan.allocations.crypto / 100) * totalCapital,
+    stocks_capital: (plan.allocations.stocks / 100) * totalCapital,
+    polymarket_capital: (plan.allocations.polymarket / 100) * totalCapital,
+    cash: (plan.allocations.cash / 100) * totalCapital,
+    total_capital: totalCapital,
+    daily_inference_cost: response.cost_usd,
+  });
+
+  return {
+    trader: TRADER_NAME,
+    timestamp,
+    success: true,
+    plan,
+    ai_cost: response.cost_usd,
+    errors,
+  };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  try {
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret) {
+      const authHeader = req.headers['authorization'];
+      if (authHeader !== `Bearer ${cronSecret}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    const result = await runStrategist();
+    return res.status(result.success ? 200 : 500).json(result);
+  } catch (err) {
+    return res.status(500).json({
+      trader: TRADER_NAME,
+      timestamp: new Date().toISOString(),
+      success: false,
+      errors: [String(err)],
     });
   }
 }
