@@ -1,0 +1,70 @@
+version: "3.9"
+
+# Development overrides -- use with:
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.dev.yml up
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+      target: dev
+    environment:
+      SYSTEM_ENV: development
+      SYSTEM_DEBUG: "true"
+    volumes:
+      - ../api:/app/api
+      - ../packages:/app/packages
+      - ../config.yaml:/app/config.yaml:ro
+    command: >
+      uvicorn api.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/api
+      --reload-dir /app/packages
+      --log-level debug
+
+  trader-polymarket:
+    volumes:
+      - ../packages:/app/packages
+      - ../config.yaml:/app/config.yaml:ro
+    environment:
+      SYSTEM_ENV: development
+      SYSTEM_DEBUG: "true"
+
+  trader-crypto:
+    volumes:
+      - ../packages:/app/packages
+      - ../config.yaml:/app/config.yaml:ro
+    environment:
+      SYSTEM_ENV: development
+      SYSTEM_DEBUG: "true"
+
+  trader-stocks:
+    volumes:
+      - ../packages:/app/packages
+      - ../config.yaml:/app/config.yaml:ro
+    environment:
+      SYSTEM_ENV: development
+      SYSTEM_DEBUG: "true"
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.dashboard
+      target: dev
+    volumes:
+      - ../dashboard/src:/app/src
+      - ../dashboard/public:/app/public
+    command: npm run dev -- --host 0.0.0.0 --port 80
+    environment:
+      VITE_API_URL: http://localhost:8000
+
+  timescaledb:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
