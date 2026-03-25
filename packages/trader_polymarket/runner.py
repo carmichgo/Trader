@@ -14,6 +14,7 @@ import structlog
 from packages.core.ai.client import AIClient
 from packages.core.ai.cost_tracker import CostTracker
 from packages.core.base_trader import BaseTrader
+from packages.core.db.supabase_client import SupabaseDB
 from packages.core.config import SystemConfig
 from packages.core.execution.order_manager import OrderManager
 from packages.core.models import (
@@ -324,6 +325,9 @@ async def run_polymarket_trader(
         initial_balance=trader_config.initial_balance,
         is_paper_trading=(trader_config.mode == "paper"),
     )
+
+    # --- Supabase persistence ---
+    supabase_db = SupabaseDB()
 
     # --- Assemble trader ---
     trader = PolymarketTrader(

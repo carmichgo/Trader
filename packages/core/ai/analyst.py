@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 from pydantic import BaseModel, Field
@@ -27,6 +27,9 @@ from packages.core.models import (
     Opportunity,
     TraderConfig,
 )
+
+if TYPE_CHECKING:
+    from packages.core.db.supabase_client import SupabaseDB
 
 logger = structlog.get_logger(__name__)
 
@@ -117,10 +120,12 @@ class Analyst:
         ai_client: AIClient,
         cost_tracker: CostTracker,
         trader_id: str = "default",
+        supabase_db: SupabaseDB | None = None,
     ) -> None:
         self._ai = ai_client
         self._cost = cost_tracker
         self._trader_id = trader_id
+        self._supabase_db = supabase_db
 
     # ------------------------------------------------------------------
     # Pre-Opus cost gate
@@ -274,6 +279,28 @@ class Analyst:
             latency_ms=response.latency_ms,
             duration_s=round(duration, 2),
         )
+
+        # Persist analyst AI decision to Supabase
+        if self._supabase_db:
+            try:
+                await self._supabase_db.insert_ai_decision({
+                    "trader": self._trader_id,
+                    "decision_type": "analyst",
+                    "symbol": opportunity.symbol,
+                    "market": market_type.value,
+                    "decision": "approve" if plan is not None else "reject",
+                    "confidence": plan.confidence if plan else opportunity.confidence,
+                    "reasoning": plan.reasoning if plan else "Rejected by analyst",
+                    "inference_cost": response.cost_usd,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "metadata": {
+                        "latency_ms": response.latency_ms,
+                        "duration_s": round(duration, 2),
+                        "opportunity_id": opportunity.id,
+                    },
+                })
+            except Exception:
+                logger.exception("supabase_analyst_decision_failed")
 
         return plan
 

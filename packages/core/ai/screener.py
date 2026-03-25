@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -23,6 +24,9 @@ from packages.core.models import (
     ScreenerResult,
     TraderConfig,
 )
+
+if TYPE_CHECKING:
+    from packages.core.db.supabase_client import SupabaseDB
 
 logger = structlog.get_logger(__name__)
 
@@ -90,10 +94,12 @@ class Screener:
         ai_client: AIClient,
         cost_tracker: CostTracker,
         trader_id: str = "default",
+        supabase_db: SupabaseDB | None = None,
     ) -> None:
         self._ai = ai_client
         self._cost = cost_tracker
         self._trader_id = trader_id
+        self._supabase_db = supabase_db
 
     async def scan(
         self,
@@ -163,6 +169,27 @@ class Screener:
             cost_usd=response.cost_usd,
             latency_ms=response.latency_ms,
         )
+
+        # Persist screener AI decision to Supabase
+        if self._supabase_db:
+            try:
+                await self._supabase_db.insert_ai_decision({
+                    "trader": self._trader_id,
+                    "decision_type": "screener",
+                    "market": market_type.value,
+                    "decision": "scan_complete",
+                    "confidence": max((o.confidence for o in opportunities), default=0.0),
+                    "reasoning": f"Scanned {len(market_snapshots)} markets, found {len(opportunities)} opportunities",
+                    "inference_cost": response.cost_usd,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "metadata": {
+                        "total_scanned": len(market_snapshots),
+                        "total_passed": len(opportunities),
+                        "latency_ms": response.latency_ms,
+                    },
+                })
+            except Exception:
+                logger.exception("supabase_screener_decision_failed")
 
         return result
 

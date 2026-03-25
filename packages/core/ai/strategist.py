@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -24,6 +24,9 @@ from packages.core.models import (
     StrategistInput,
     StrategistOutput,
 )
+
+if TYPE_CHECKING:
+    from packages.core.db.supabase_client import SupabaseDB
 
 logger = structlog.get_logger(__name__)
 
@@ -52,10 +55,12 @@ class Strategist:
         ai_client: AIClient,
         cost_tracker: CostTracker,
         trader_id: str = "default",
+        supabase_db: SupabaseDB | None = None,
     ) -> None:
         self._ai = ai_client
         self._cost = cost_tracker
         self._trader_id = trader_id
+        self._supabase_db = supabase_db
 
     # ------------------------------------------------------------------
     # Daily run
@@ -161,6 +166,25 @@ class Strategist:
             cost_usd=response.cost_usd,
             latency_ms=response.latency_ms,
         )
+
+        # Persist strategist plan to Supabase
+        if self._supabase_db:
+            try:
+                await self._supabase_db.insert_strategist_plan({
+                    "trader": self._trader_id,
+                    "plan_type": "daily",
+                    "confidence": output.confidence,
+                    "reasoning": output.reasoning,
+                    "recommended_trades": output.recommended_trades,
+                    "positions_to_close": output.positions_to_close,
+                    "positions_to_adjust": output.positions_to_adjust,
+                    "rebalance_actions": output.rebalance_actions,
+                    "risk_assessment": output.risk_assessment,
+                    "inference_cost": output.inference_cost,
+                    "created_at": datetime.utcnow().isoformat(),
+                })
+            except Exception:
+                logger.exception("supabase_strategist_plan_failed")
 
         return output
 

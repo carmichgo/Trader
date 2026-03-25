@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 
@@ -41,6 +42,9 @@ from packages.core.planning.pace_monitor import PaceMonitor
 from packages.core.risk.drawdown_monitor import DrawdownMonitor
 from packages.core.risk.frequency_limiter import FrequencyLimiter
 from packages.core.risk.manager import RiskCheckResult, RiskManager, TradePlan
+
+if TYPE_CHECKING:
+    from packages.core.db.supabase_client import SupabaseDB
 
 logger = structlog.get_logger(__name__)
 
@@ -76,6 +80,7 @@ class BaseTrader(ABC):
         frequency_limiter: FrequencyLimiter,
         pace_monitor: PaceMonitor,
         portfolio: TraderPortfolio | None = None,
+        supabase_db: SupabaseDB | None = None,
     ) -> None:
         self.trader_name = trader_name
         self.market = market
@@ -96,8 +101,12 @@ class BaseTrader(ABC):
         )
 
         # AI sub-systems
-        self.screener = Screener(ai_client, cost_tracker, trader_id=trader_name)
-        self.analyst = Analyst(ai_client, cost_tracker, trader_id=trader_name)
+        self.screener = Screener(ai_client, cost_tracker, trader_id=trader_name, supabase_db=supabase_db)
+        self.analyst = Analyst(ai_client, cost_tracker, trader_id=trader_name, supabase_db=supabase_db)
+
+        # Supabase persistence (optional)
+        self.supabase_db: SupabaseDB | None = supabase_db
+        self._last_snapshot_time: float = 0.0
 
         self._running = False
 
@@ -188,6 +197,9 @@ class BaseTrader(ABC):
 
         # ---- 5. Monitor existing positions -------------------------------
         await self.monitor_positions()
+
+        # ---- 6. Periodic portfolio snapshot to Supabase ------------------
+        await self._persist_snapshot()
 
     def _preflight_checks(self, log: Any) -> bool:
         """Return True if trading is allowed, False otherwise."""
@@ -330,6 +342,43 @@ class BaseTrader(ABC):
             target=trade_plan.take_profit_price,
         )
 
+        # Persist trade to Supabase
+        if self.supabase_db:
+            try:
+                await self.supabase_db.insert_trade({
+                    "trade_id": trade.id,
+                    "market": self.market.value,
+                    "symbol": opp.symbol,
+                    "direction": trade_plan.direction.value,
+                    "strategy": self.trader_name,
+                    "entry_price": trade_plan.entry_price,
+                    "quantity": order.quantity,
+                    "stop_loss_price": trade_plan.stop_loss_price,
+                    "take_profit_price": trade_plan.take_profit_price,
+                    "leverage": trade_plan.leverage,
+                    "confidence": trade_plan.confidence,
+                    "position_size_usd": trade_plan.position_size_usd,
+                    "status": "open",
+                    "created_at": datetime.utcnow().isoformat(),
+                })
+            except Exception:
+                log.exception("supabase_insert_trade_failed")
+
+            try:
+                await self.supabase_db.insert_ai_decision({
+                    "trader": self.trader_name,
+                    "decision_type": "analyst",
+                    "symbol": opp.symbol,
+                    "market": self.market.value,
+                    "decision": "approve",
+                    "confidence": trade_plan.confidence,
+                    "reasoning": trade_plan.reasoning,
+                    "inference_cost": trade_plan.inference_cost,
+                    "created_at": datetime.utcnow().isoformat(),
+                })
+            except Exception:
+                log.exception("supabase_insert_ai_decision_failed")
+
     # ------------------------------------------------------------------
     # Position monitoring
     # ------------------------------------------------------------------
@@ -411,6 +460,21 @@ class BaseTrader(ABC):
                         self.portfolio.active_trades.remove(trade)
                         self.portfolio.trade_history.append(trade)
                         self.portfolio.current_state.open_position_count -= 1
+
+                        # Persist close to Supabase
+                        if self.supabase_db:
+                            try:
+                                await self.supabase_db.close_trade(
+                                    trade_id=trade.id,
+                                    exit_price=pos.current_price or 0.0,
+                                    gross_pnl=trade.realized_pnl or 0.0,
+                                    net_pnl=trade.net_pnl or 0.0,
+                                    close_reason=reason.value,
+                                    costs=trade.fees_paid,
+                                )
+                            except Exception:
+                                log.exception("supabase_close_trade_failed")
+
                         break
 
                 log.info(
@@ -421,6 +485,42 @@ class BaseTrader(ABC):
                 )
             except Exception:
                 log.exception("position_close_failed", position_id=pos.id)
+
+    # ------------------------------------------------------------------
+    # Periodic Supabase snapshot
+    # ------------------------------------------------------------------
+
+    async def _persist_snapshot(self) -> None:
+        """Write a portfolio snapshot to Supabase every 5 minutes."""
+        if not self.supabase_db:
+            return
+
+        now = time.time()
+        if now - self._last_snapshot_time < 300:  # 5 minutes
+            return
+
+        self._last_snapshot_time = now
+        state = self.portfolio.current_state
+
+        try:
+            await self.supabase_db.insert_portfolio_snapshot({
+                "trader": self.trader_name,
+                "market": self.market.value,
+                "total_balance": state.total_balance,
+                "available_balance": state.available_balance,
+                "allocated_balance": state.allocated_balance,
+                "unrealized_pnl": state.unrealized_pnl,
+                "realized_pnl_today": state.realized_pnl_today,
+                "realized_pnl_total": state.realized_pnl_total,
+                "open_position_count": state.open_position_count,
+                "win_rate": state.win_rate,
+                "current_drawdown": state.current_drawdown,
+                "peak_balance": state.peak_balance,
+                "total_trades": state.total_trades,
+                "created_at": datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            logger.exception("supabase_snapshot_failed", trader=self.trader_name)
 
     # ------------------------------------------------------------------
     # Helper: convert Opportunity to NormalizedSignal for risk manager
