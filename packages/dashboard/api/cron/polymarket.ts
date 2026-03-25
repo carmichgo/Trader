@@ -282,6 +282,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // COST CAP: Check daily spend before making any AI calls
+    const dailyCost = await getDailyCostSoFar();
+    if (dailyCost >= DAILY_COST_CAP_USD) {
+      return res.status(200).json({
+        ...result,
+        errors: [`Daily cost cap reached: $${dailyCost.toFixed(4)} >= $${DAILY_COST_CAP_USD}. Skipping.`],
+      });
+    }
+
+    // Load latest strategist plan
+    const { data: plans } = await supabase
+      .from('strategist_plans')
+      .select('trader_configs, allocations, daily_target, risk_posture')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const plan = plans?.[0] as Record<string, unknown> | undefined;
+    const directives = (plan?.trader_configs as Record<string, unknown>)?.polymarket as {
+      enabled?: boolean;
+      max_position_pct?: number;
+      confidence_threshold?: number;
+      max_event_horizon_days?: number;
+      focus_categories?: string[];
+      strategy_notes?: string;
+    } | undefined;
+
+    // Skip if strategist disabled this trader
+    if (directives && directives.enabled === false) {
+      return res.status(200).json({
+        ...result,
+        errors: ['Polymarket trader disabled by strategist'],
+      });
+    }
+
     // 1. Fetch Polymarket data
     const markets = await fetchPolymarkets();
     if (markets.length === 0) {
@@ -289,13 +322,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json(result);
     }
 
-    const snapshot = buildMarketSnapshot(markets);
+    // Filter out markets whose endDate is beyond the strategist's max horizon
+    const maxHorizonDays = directives?.max_event_horizon_days;
+    let filteredMarkets = markets;
+    if (maxHorizonDays && maxHorizonDays > 0) {
+      const horizonCutoff = new Date(Date.now() + maxHorizonDays * 24 * 60 * 60 * 1000);
+      filteredMarkets = markets.filter((m) => {
+        if (!m.endDate) return false; // Skip markets with no end date
+        const endDate = new Date(m.endDate);
+        return endDate <= horizonCutoff;
+      });
+      if (filteredMarkets.length === 0) {
+        result.errors.push(`No markets resolve within ${maxHorizonDays}-day horizon. Skipping.`);
+        return res.status(200).json(result);
+      }
+    }
+
+    const snapshot = buildMarketSnapshot(filteredMarkets);
+
+    // 2. Build screener prompt with strategist directives
+    const strategistContext = directives
+      ? `\n\nSTRATEGIST DIRECTIVES:
+- Risk posture: ${plan?.risk_posture ?? 'moderate'}
+- Confidence threshold: ${directives.confidence_threshold ?? 70} (only flag opportunities scoring above this)
+- Max event horizon: ${directives.max_event_horizon_days ?? 'unlimited'} days (only analyze events resolving within this timeframe)
+- Focus categories: ${directives.focus_categories?.join(', ') ?? 'any'}
+- Strategy notes: ${directives.strategy_notes ?? 'none'}
+- Daily P&L target: $${plan?.daily_target ?? 0}
+- Max position size: ${directives.max_position_pct ?? 10}% of allocation per trade`
+      : '';
+
+    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT + strategistContext;
 
     // 2. Screen with Sonnet
     const screenerResponse = await callClaude(
       SONNET,
-      SCREENER_SYSTEM_PROMPT,
-      `Be very selective. Only flag strong opportunities.
+      screenerSystemPrompt,
+      `Be very selective. Only flag strong opportunities.${maxHorizonDays ? ` Only analyze events that will resolve within ${maxHorizonDays} days.` : ''}
 
 Analyze these prediction markets for mispriced events:\n\n${snapshot}`
     );
@@ -320,12 +383,23 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    const viable = opportunities.filter((o) => o.score >= 70);
+    // Filter for high confidence using strategist threshold
+    const minScore = directives?.confidence_threshold ?? 70;
+    const viable = opportunities.filter((o) => o.score >= minScore);
     result.opportunities_found = viable.length;
 
-    // 3. Deep-analyze high-scoring opportunities with Opus
+    // 3. Deep-analyze high-scoring opportunities
+    const analystThreshold = directives?.confidence_threshold
+      ? Math.max(directives.confidence_threshold, 85)
+      : 90;
+    const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
-      if (opp.score < 90) continue;
+      // Skip analyst if cost cap would be exceeded
+      if (updatedDailyCost >= DAILY_COST_CAP_USD * 0.8) {
+        result.errors.push(`Near daily cap ($${updatedDailyCost.toFixed(4)}), skipping analyst for ${opp.asset}`);
+        continue;
+      }
+      if (opp.score < analystThreshold) continue;
 
       const market = markets.find(
         (m) => m.slug === opp.asset || m.question.toLowerCase().includes(opp.asset.toLowerCase())

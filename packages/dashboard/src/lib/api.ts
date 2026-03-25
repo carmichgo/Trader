@@ -700,6 +700,9 @@ export async function updateGoal(body: {
     if (error) throw new Error(`updateGoal insert: ${error.message}`);
   }
 
+  // Trigger strategist to rethink strategy based on new goal
+  await fetch('/api/trigger-strategist', { method: 'POST' }).catch(() => {});
+
   return getGoal();
 }
 
