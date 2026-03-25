@@ -366,17 +366,12 @@ Based on the goal and current state, create the trading plan with per-trader dir
     plan_date: new Date().toISOString().split('T')[0],
     allocations: plan.allocations,
     trader_configs: plan.trader_directives,
-    risk_posture: plan.risk_posture,
     daily_target: plan.daily_pnl_target_usd,
-    reasoning: plan.reasoning,
+    reasoning: `[${plan.risk_posture}] [${plan.goal_feasibility}] ${plan.reasoning}`,
     goal_feasibility: plan.goal_feasibility,
-    model: SONNET,
     inference_cost: response.cost_usd,
     tokens_in: response.input_tokens,
     tokens_out: response.output_tokens,
-    // Keep backward compat fields
-    date: new Date().toISOString().split('T')[0],
-    cost_usd: response.cost_usd,
   });
 
   if (planError) {
