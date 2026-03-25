@@ -231,6 +231,19 @@ function calculateNEV(
   return potentialProfit * winProb - potentialLoss * (1 - winProb) - inferenceCost;
 }
 
+// Daily cost cap
+const DAILY_COST_CAP_USD = 1.00;
+
+async function getDailyCostSoFar(): Promise<number> {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const { data } = await supabase
+    .from('ai_decisions')
+    .select('cost_usd')
+    .gte('created_at', todayStart.toISOString());
+  return (data ?? []).reduce((sum: number, d: { cost_usd: number }) => sum + (d.cost_usd ?? 0), 0);
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const result: CronResult = {
     trader: TRADER_NAME,
@@ -263,7 +276,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const screenerResponse = await callClaude(
       SONNET,
       SCREENER_SYSTEM_PROMPT,
-      `Analyze these prediction markets for mispriced events:\n\n${snapshot}`
+      `Be very selective. Only flag strong opportunities.
+
+Analyze these prediction markets for mispriced events:\n\n${snapshot}`
     );
 
     await supabase.from('ai_decisions').insert({
@@ -291,7 +306,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 3. Deep-analyze high-scoring opportunities with Opus
     for (const opp of viable) {
-      if (opp.score < 80) continue;
+      if (opp.score < 90) continue;
 
       const market = markets.find(
         (m) => m.slug === opp.asset || m.question.toLowerCase().includes(opp.asset.toLowerCase())
@@ -311,7 +326,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels (in 
 
       let analystResponse;
       try {
-        analystResponse = await callClaude(OPUS, ANALYST_SYSTEM_PROMPT, analystPrompt, 2048);
+        analystResponse = await callClaude(SONNET, ANALYST_SYSTEM_PROMPT, analystPrompt, 2048);
       } catch (err) {
         result.errors.push(`Analyst call failed for ${opp.asset}: ${String(err)}`);
         continue;
@@ -320,7 +335,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels (in 
       await supabase.from('ai_decisions').insert({
         decision_type: 'analyst',
         trader: TRADER_NAME,
-        model: OPUS,
+        model: SONNET,
         prompt_tokens: analystResponse.input_tokens,
         completion_tokens: analystResponse.output_tokens,
         cost_usd: analystResponse.cost_usd,
@@ -359,7 +374,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels (in 
         take_profit: analyst.take_profit,
         status: 'open',
         ai_confidence: analyst.confidence,
-        ai_model_used: OPUS,
+        ai_model_used: 'sonnet',
         screener_cost: screenerResponse.cost_usd,
         analyst_cost: analystResponse.cost_usd,
         total_cost: totalInferenceCost,

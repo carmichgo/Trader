@@ -219,6 +219,33 @@ function calculateNEV(
   return potentialProfit * winProb - potentialLoss * (1 - winProb) - inferencesCost;
 }
 
+// Daily cost cap: stop AI calls if we've spent more than this today
+const DAILY_COST_CAP_USD = 1.00;
+// Only run analyst on very high-confidence screener results
+const ANALYST_THRESHOLD = 85;
+
+async function getDailyCostSoFar(): Promise<number> {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const { data } = await supabase
+    .from('ai_decisions')
+    .select('cost_usd')
+    .gte('created_at', todayStart.toISOString());
+  return (data ?? []).reduce((sum: number, d: { cost_usd: number }) => sum + (d.cost_usd ?? 0), 0);
+}
+
+async function hasRecentScan(traderName: string, minutesAgo: number): Promise<boolean> {
+  const since = new Date(Date.now() - minutesAgo * 60 * 1000).toISOString();
+  const { data } = await supabase
+    .from('ai_decisions')
+    .select('id')
+    .eq('trader', traderName)
+    .eq('decision_type', 'screener')
+    .gte('created_at', since)
+    .limit(1);
+  return (data ?? []).length > 0;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const result: CronResult = {
     trader: TRADER_NAME,
@@ -239,6 +266,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // COST CAP: Check daily spend before making any AI calls
+    const dailyCost = await getDailyCostSoFar();
+    if (dailyCost >= DAILY_COST_CAP_USD) {
+      return res.status(200).json({
+        ...result,
+        errors: [`Daily cost cap reached: $${dailyCost.toFixed(4)} >= $${DAILY_COST_CAP_USD}. Skipping.`],
+      });
+    }
+
+    // DEDUP: Skip if we already scanned in the last 10 minutes
+    if (await hasRecentScan(TRADER_NAME, 10)) {
+      return res.status(200).json({
+        ...result,
+        errors: ['Recent scan exists within 10 minutes. Skipping.'],
+      });
+    }
+
     // 1. Fetch market data
     let markets: MarketData[];
     try {
@@ -249,11 +293,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const snapshot = buildMarketSnapshot(markets);
 
-    // 2. Screen with Sonnet
+    // 2. Screen with Sonnet (cost: ~$0.005)
     const screenerResponse = await callClaude(
       SONNET,
       SCREENER_SYSTEM_PROMPT,
-      `Analyze this market data and identify trading opportunities:\n\n${snapshot}`
+      `Analyze this market data and identify trading opportunities. Be very selective — only flag strong setups.\n\n${snapshot}`,
+      1024
     );
 
     // Log screener decision
@@ -265,7 +310,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       completion_tokens: screenerResponse.output_tokens,
       cost_usd: screenerResponse.cost_usd,
       latency_ms: screenerResponse.latency_ms,
-      input_summary: snapshot.slice(0, 500),
+      input_summary: { market: 'crypto', assets: Object.keys(COIN_SYMBOLS).length, cost_today: dailyCost + screenerResponse.cost_usd },
       output_raw: screenerResponse.content,
     });
     result.decisions_logged++;
@@ -277,47 +322,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Filter for high confidence (>= 70)
+    // Filter for high confidence
     const viable = opportunities.filter((o) => o.score >= 70);
     result.opportunities_found = viable.length;
 
-    // 3. Deep-analyze high-scoring opportunities with Opus
+    // 3. Only deep-analyze VERY high-scoring opportunities (saves cost)
+    const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
-      if (opp.score < 80) continue;
+      // Skip analyst if cost cap would be exceeded
+      if (updatedDailyCost >= DAILY_COST_CAP_USD * 0.8) {
+        result.errors.push(`Near daily cap ($${updatedDailyCost.toFixed(4)}), skipping analyst for ${opp.asset}`);
+        continue;
+      }
+      if (opp.score < ANALYST_THRESHOLD) continue;
 
       const marketItem = markets.find((m) => m.symbol === opp.asset);
-      const analystPrompt = `Trading opportunity identified by screener:
-Asset: ${opp.asset}
-Direction: ${opp.direction}
-Screener Score: ${opp.score}/100
-Estimated Edge: ${opp.estimated_edge_pct}%
-Win Probability: ${(opp.win_probability * 100).toFixed(1)}%
+      const analystPrompt = `Trading opportunity:
+${opp.asset} | ${opp.direction} | Score: ${opp.score}/100 | Edge: ${opp.estimated_edge_pct}% | WinProb: ${(opp.win_probability * 100).toFixed(0)}%
+Price: $${marketItem?.price ?? '?'} | 24h: ${marketItem?.change_24h_pct?.toFixed(2) ?? '?'}%
 Rationale: ${opp.rationale}
-
-Current Price: $${marketItem?.price ?? 'unknown'}
-24h Change: ${marketItem?.change_24h_pct?.toFixed(2) ?? 'N/A'}%
-24h Volume: $${marketItem?.volume_24h ? (marketItem.volume_24h / 1e6).toFixed(1) + 'M' : 'N/A'}
-
-Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
+Should we trade? Provide entry, stop-loss, take-profit levels.`;
 
       let analystResponse;
       try {
-        analystResponse = await callClaude(SONNET, ANALYST_SYSTEM_PROMPT, analystPrompt, 2048);
+        analystResponse = await callClaude(SONNET, ANALYST_SYSTEM_PROMPT, analystPrompt, 1024);
       } catch (err) {
-        result.errors.push(`Analyst call failed for ${opp.asset}: ${String(err)}`);
+        result.errors.push(`Analyst failed for ${opp.asset}: ${String(err)}`);
         continue;
       }
 
-      // Log analyst decision
       await supabase.from('ai_decisions').insert({
         decision_type: 'analyst',
         trader: TRADER_NAME,
-        model: OPUS,
+        model: SONNET,
         prompt_tokens: analystResponse.input_tokens,
         completion_tokens: analystResponse.output_tokens,
         cost_usd: analystResponse.cost_usd,
         latency_ms: analystResponse.latency_ms,
-        input_summary: analystPrompt.slice(0, 500),
+        input_summary: { asset: opp.asset, score: opp.score },
         output_raw: analystResponse.content,
       });
       result.decisions_logged++;
@@ -332,27 +374,36 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
 
       if (analyst.action === 'reject') continue;
 
-      // Calculate NEV
+      // NEV check
       const totalInferenceCost = screenerResponse.cost_usd + analystResponse.cost_usd;
       const nev = calculateNEV(analyst, totalInferenceCost);
       if (nev <= 0) {
-        result.errors.push(`NEV negative for ${opp.asset}: ${nev.toFixed(4)}, skipping`);
+        result.errors.push(`NEV negative for ${opp.asset}: ${nev.toFixed(4)}, skip`);
         continue;
       }
 
-      // Insert trade
+      // Get current goal for position sizing
+      const { data: goal } = await supabase
+        .from('goals')
+        .select('starting_capital')
+        .eq('is_active', true)
+        .limit(1)
+        .maybeSingle();
+      const capital = (goal?.starting_capital as number) ?? 10000;
+      const posSize = (analyst.size_pct / 100) * capital;
+
       const { error: tradeError } = await supabase.from('trades').insert({
         trader: TRADER_NAME,
         asset: opp.asset,
         direction: opp.direction,
-        position_size_usd: analyst.size_pct * 10, // paper trading with ~$1000 portfolio
-        quantity: analyst.size_pct * 10 / analyst.entry_price,
+        position_size_usd: posSize,
+        quantity: posSize / analyst.entry_price,
         entry_price: analyst.entry_price,
         stop_loss: analyst.stop_loss,
         take_profit: analyst.take_profit,
         status: 'open',
         ai_confidence: analyst.confidence,
-        ai_model_used: 'sonnet+sonnet',
+        ai_model_used: 'sonnet',
         screener_cost: screenerResponse.cost_usd,
         analyst_cost: analystResponse.cost_usd,
         total_cost: totalInferenceCost,
@@ -362,19 +413,11 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
       });
 
       if (tradeError) {
-        result.errors.push(`Failed to insert trade for ${opp.asset}: ${tradeError.message}`);
+        result.errors.push(`Trade insert failed: ${tradeError.message}`);
       } else {
         result.trades_opened++;
       }
     }
-
-    // 4. Insert portfolio snapshot
-    await supabase.from('portfolio_snapshots').insert({
-      time: new Date().toISOString(),
-      crypto_capital: markets.reduce((sum, m) => sum + (m.price > 0 ? 1 : 0), 0) * 100,
-      total_capital: 1000,
-      daily_inference_cost: screenerResponse.cost_usd,
-    });
 
     return res.status(200).json(result);
   } catch (err) {
