@@ -220,7 +220,7 @@ function calculateNEV(
 }
 
 // Daily cost cap: stop AI calls if we've spent more than this today
-const DAILY_COST_CAP_USD = 1.00;
+const DAILY_COST_CAP_USD = 10.00;
 // Only run analyst on very high-confidence screener results
 const ANALYST_THRESHOLD = 85;
 

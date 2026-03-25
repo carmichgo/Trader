@@ -174,7 +174,7 @@ function isMarketOpen(): boolean {
   const totalMinutes = hours * 60 + minutes;
 
   // 9:30 AM = 570 min, 4:00 PM = 960 min
-  return totalMinutes >= 570 && totalMinutes <= 960;
+  return totalMinutes >= 420 && totalMinutes <= 1200;
 }
 
 /**
@@ -275,7 +275,7 @@ function calculateNEV(analyst: AnalystDecision, inferenceCost: number): number {
 }
 
 // Daily cost cap
-const DAILY_COST_CAP_USD = 1.00;
+const DAILY_COST_CAP_USD = 10.00;
 
 async function getDailyCostSoFar(): Promise<number> {
   const todayStart = new Date();

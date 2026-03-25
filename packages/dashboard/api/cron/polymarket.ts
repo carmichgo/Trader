@@ -164,37 +164,56 @@ Respond ONLY with a JSON object:
 - reasoning: string (detailed analysis of why market is mispriced)`;
 
 async function fetchPolymarkets(): Promise<PolymarketMarket[]> {
-  const url =
-    'https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volume&ascending=false';
+  // Use /events endpoint for high-volume, real markets (politics, sports, crypto, macro)
+  // Fetch multiple pages of events to get diverse categories
+  const allMarkets: PolymarketMarket[] = [];
 
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Polymarket API error: ${response.status}`);
+  for (const offset of [0, 10, 20]) {
+    const url = `https://gamma-api.polymarket.com/events?closed=false&limit=10&order=volume&ascending=false&offset=${offset}`;
+    const response = await fetch(url);
+    if (!response.ok) continue;
+    const events = await response.json();
+
+    for (const event of (Array.isArray(events) ? events : [])) {
+      const eventMarkets = event.markets ?? [];
+      // Take top 2 markets per event (by volume) to get variety
+      const sorted = [...eventMarkets].sort((a: Record<string, unknown>, b: Record<string, unknown>) =>
+        Number(b.volume ?? 0) - Number(a.volume ?? 0)
+      ).slice(0, 2);
+
+      for (const m of sorted) {
+        allMarkets.push({
+          id: String(m.id ?? ''),
+          question: String(m.question ?? event.title ?? ''),
+          slug: String(m.slug ?? ''),
+          outcomes: Array.isArray(m.outcomes) ? (m.outcomes as string[]) : [],
+          outcomePrices: Array.isArray(m.outcomePrices)
+            ? (m.outcomePrices as string[])
+            : typeof m.outcomePrices === 'string'
+              ? JSON.parse(m.outcomePrices)
+              : [],
+          volume: Number(m.volume ?? 0),
+          liquidity: Number(m.liquidity ?? 0),
+          endDate: String(m.endDate ?? event.endDate ?? ''),
+          active: Boolean(m.active ?? true),
+          closed: Boolean(m.closed ?? false),
+          category: String(event.category ?? event.title ?? '').slice(0, 50),
+        });
+      }
+    }
   }
-  const data = await response.json();
 
-  // The API returns an array of market objects
-  const markets: PolymarketMarket[] = (Array.isArray(data) ? data : []).map(
-    (m: Record<string, unknown>) => ({
-      id: String(m.id ?? ''),
-      question: String(m.question ?? ''),
-      slug: String(m.slug ?? ''),
-      outcomes: Array.isArray(m.outcomes) ? (m.outcomes as string[]) : [],
-      outcomePrices: Array.isArray(m.outcomePrices)
-        ? (m.outcomePrices as string[])
-        : typeof m.outcomePrices === 'string'
-          ? JSON.parse(m.outcomePrices)
-          : [],
-      volume: Number(m.volume ?? 0),
-      liquidity: Number(m.liquidity ?? 0),
-      endDate: String(m.endDate ?? ''),
-      active: Boolean(m.active),
-      closed: Boolean(m.closed),
-      category: m.category ? String(m.category) : undefined,
-    })
-  );
+  // Deduplicate by id and sort by volume
+  const seen = new Set<string>();
+  const unique = allMarkets.filter(m => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return !m.closed;
+  });
+  unique.sort((a, b) => b.volume - a.volume);
 
-  return markets;
+  // Return top 30 most liquid markets across all categories
+  return unique.slice(0, 30);
 }
 
 function buildMarketSnapshot(markets: PolymarketMarket[]): string {
@@ -232,7 +251,7 @@ function calculateNEV(
 }
 
 // Daily cost cap
-const DAILY_COST_CAP_USD = 1.00;
+const DAILY_COST_CAP_USD = 10.00;
 
 async function getDailyCostSoFar(): Promise<number> {
   const todayStart = new Date();
