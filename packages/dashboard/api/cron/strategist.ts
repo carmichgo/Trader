@@ -1,6 +1,97 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { supabase } from '../lib/supabase-server';
-import { callClaude, extractJSON } from '../lib/anthropic';
+import { createClient } from '@supabase/supabase-js';
+
+// ── Inlined: Supabase client ──
+const supabaseUrl = process.env.STORAGE_SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+const supabaseKey = process.env.STORAGE_SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// ── Inlined: Types ──
+interface ClaudeResponse {
+  content: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  latency_ms: number;
+  model: string;
+}
+
+// ── Inlined: Claude helpers ──
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+
+const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  'claude-sonnet-4-20250514': { input: 3, output: 15 },
+  'claude-opus-4-20250514': { input: 15, output: 75 },
+};
+
+async function callClaude(
+  model: string,
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number = 4096
+): Promise<ClaudeResponse> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY is not set');
+  }
+
+  const start = Date.now();
+
+  const response = await fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    }),
+  });
+
+  const latencyMs = Date.now() - start;
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Anthropic API error ${response.status}: ${errorBody}`);
+  }
+
+  const data = await response.json();
+
+  const inputTokens: number = data.usage?.input_tokens ?? 0;
+  const outputTokens: number = data.usage?.output_tokens ?? 0;
+
+  const pricing = MODEL_PRICING[model] ?? { input: 3, output: 15 };
+  const costUsd =
+    (inputTokens * pricing.input) / 1_000_000 +
+    (outputTokens * pricing.output) / 1_000_000;
+
+  const content =
+    data.content
+      ?.filter((block: { type: string }) => block.type === 'text')
+      .map((block: { text: string }) => block.text)
+      .join('') ?? '';
+
+  return {
+    content,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cost_usd: costUsd,
+    latency_ms: latencyMs,
+    model,
+  };
+}
+
+function extractJSON<T = unknown>(raw: string): T {
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const toParse = fenceMatch ? fenceMatch[1]!.trim() : raw.trim();
+  return JSON.parse(toParse) as T;
+}
+
+// ── Strategist logic ──
 
 const OPUS = 'claude-opus-4-20250514';
 const TRADER_NAME = 'strategist';

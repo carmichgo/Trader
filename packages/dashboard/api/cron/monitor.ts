@@ -1,5 +1,10 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { supabase } from '../lib/supabase-server';
+import { createClient } from '@supabase/supabase-js';
+
+// ── Inlined: Supabase client ──
+const supabaseUrl = process.env.STORAGE_SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+const supabaseKey = process.env.STORAGE_SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 const TRADER_NAME = 'monitor';
 
