@@ -1,7 +1,8 @@
 """Stock market data preprocessing for AI consumption.
 
-Transforms market data, fundamentals, and macro indicators into
-structured contexts for the Screener (Sonnet) and Analyst (Opus).
+Transforms Alpaca market data, fundamental metrics, macro indicators,
+and options flow into structured contexts for the Screener (Sonnet)
+and Analyst (Opus).
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ logger = structlog.get_logger(__name__)
 class StockStrategy:
     """Prepares stock market data for AI analysis.
 
-    Combines price data, technical indicators, fundamental metrics,
-    and macroeconomic context into AI-consumable formats.
+    Combines price data, technical indicators, fundamentals, macro
+    conditions, and options flow into AI-consumable contexts.
 
     Parameters
     ----------
@@ -46,36 +47,38 @@ class StockStrategy:
         ticker_data: dict[str, Any],
         bars: list[dict[str, Any]] | None = None,
         fundamentals: dict[str, Any] | None = None,
-        macro_context: dict[str, Any] | None = None,
+        macro_data: dict[str, Any] | None = None,
     ) -> MarketSnapshot:
-        """Build a :class:`MarketSnapshot` from stock market data.
+        """Build a :class:`MarketSnapshot` from multiple stock data sources.
 
         Parameters
         ----------
         ticker_data:
-            Current price/quote data.
+            Snapshot dict from Alpaca (price, bid, ask, volume, etc.).
         bars:
-            Historical OHLCV bars.
+            Historical OHLCV bar data for technical analysis.
         fundamentals:
-            Fundamental ratios (P/E, P/S, ROE, etc.).
-        macro_context:
-            Macroeconomic regime and indicators.
+            Fundamental metrics (P/E, earnings, revenue growth).
+        macro_data:
+            Macro environment summary (regime, yield curve, VIX).
         """
         symbol = ticker_data.get("symbol", "UNKNOWN")
-        price = ticker_data.get("price", 0.0)
+        price = ticker_data.get("latest_trade_price", 0.0)
 
         metadata: dict[str, Any] = {}
 
         if bars:
-            metadata["technical"] = self._compute_technicals(bars)
+            metadata["technical_summary"] = self._summarize_bars(bars)
 
         if fundamentals:
             metadata["fundamentals"] = fundamentals
 
-        if macro_context:
-            metadata["macro"] = macro_context
+        if macro_data:
+            metadata["macro"] = macro_data
 
-        prev_close = ticker_data.get("prev_close", price)
+        bid = ticker_data.get("latest_quote_bid")
+        ask = ticker_data.get("latest_quote_ask")
+        prev_close = ticker_data.get("prev_daily_close", price)
         change_pct = (
             (price - prev_close) / prev_close * 100
             if prev_close and prev_close > 0
@@ -86,18 +89,13 @@ class StockStrategy:
             market=Market.STOCKS,
             symbol=symbol,
             price=price,
-            bid=ticker_data.get("bid"),
-            ask=ticker_data.get("ask"),
-            spread=(
-                ticker_data["ask"] - ticker_data["bid"]
-                if ticker_data.get("ask") and ticker_data.get("bid")
-                else None
-            ),
-            volume_24h=ticker_data.get("volume"),
+            bid=bid,
+            ask=ask,
+            spread=(ask - bid) if (bid and ask) else None,
+            volume_24h=ticker_data.get("daily_bar_volume"),
             change_24h_pct=change_pct,
-            high_24h=ticker_data.get("high"),
-            low_24h=ticker_data.get("low"),
-            market_cap=ticker_data.get("market_cap"),
+            high_24h=ticker_data.get("daily_bar_high"),
+            low_24h=ticker_data.get("daily_bar_low"),
             timestamp=datetime.now(timezone.utc),
             source="stock_strategy",
             metadata=metadata,
@@ -115,37 +113,39 @@ class StockStrategy:
         recent_trades: list[dict[str, Any]],
         bars_data: dict[str, list[dict[str, Any]]] | None = None,
         fundamentals_data: dict[str, dict[str, Any]] | None = None,
-        macro_data: dict[str, Any] | None = None,
-        sector_performance: dict[str, float] | None = None,
+        macro_summary: dict[str, Any] | None = None,
+        options_flow: dict[str, dict[str, Any]] | None = None,
+        analyst_ratings: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Assemble the full context for Opus analyst evaluation.
 
-        Provides comprehensive stock analysis context including
-        technicals, fundamentals, macro backdrop, and sector data.
+        Returns a comprehensive context with all relevant stock data
+        the analyst needs to make an informed trade decision.
         """
         symbol = opportunity.symbol
 
+        # Find the matching snapshot
         target_snapshot = next(
             (s for s in snapshots if s.symbol == symbol),
             None,
         )
 
-        # Technical analysis from bars
+        # Build technical analysis from bars
         technical_analysis = {}
         if bars_data and symbol in bars_data:
-            technical_analysis = self._compute_technicals(bars_data[symbol])
+            technical_analysis = self._compute_technical_indicators(
+                bars_data[symbol]
+            )
 
-        # Peer comparison
-        peers = self._find_peers(symbol, snapshots)
-
-        # Market breadth: how many stocks are up vs down
-        up_count = sum(
-            1 for s in snapshots if s.change_24h_pct and s.change_24h_pct > 0
-        )
-        down_count = sum(
-            1 for s in snapshots if s.change_24h_pct and s.change_24h_pct < 0
-        )
-        total = up_count + down_count
+        # Sector context: how are sector ETFs performing?
+        sector_context = {}
+        for snapshot in snapshots:
+            if snapshot.symbol in ("SPY", "QQQ", "IWM", "DIA"):
+                sector_context[snapshot.symbol] = {
+                    "price": snapshot.price,
+                    "change_24h": snapshot.change_24h_pct,
+                    "volume": snapshot.volume_24h,
+                }
 
         return {
             "opportunity": {
@@ -164,16 +164,14 @@ class StockStrategy:
             "fundamentals": (
                 fundamentals_data.get(symbol, {}) if fundamentals_data else {}
             ),
-            "macro_context": macro_data or {},
-            "sector_performance": sector_performance or {},
-            "market_breadth": {
-                "advancing": up_count,
-                "declining": down_count,
-                "breadth_ratio": (
-                    up_count / total if total > 0 else 0.5
-                ),
-            },
-            "peers": peers,
+            "macro_environment": macro_summary or {},
+            "options_flow": (
+                options_flow.get(symbol, {}) if options_flow else {}
+            ),
+            "analyst_ratings": (
+                analyst_ratings.get(symbol, {}) if analyst_ratings else {}
+            ),
+            "sector_context": sector_context,
             "portfolio_state": portfolio_state.model_dump(),
             "recent_trades": recent_trades[-10:],
             "risk_limits": {
@@ -194,7 +192,7 @@ class StockStrategy:
         self,
         snapshots: list[MarketSnapshot],
     ) -> list[dict[str, Any]]:
-        """Compress stock snapshots for token-efficient screener input."""
+        """Compress market snapshots into a token-efficient format for the screener."""
         compressed: list[dict[str, Any]] = []
 
         for s in snapshots:
@@ -202,31 +200,27 @@ class StockStrategy:
             entry: dict[str, Any] = {
                 "sym": s.symbol,
                 "px": round(s.price, 2),
-                "chg": round(s.change_24h_pct, 2) if s.change_24h_pct else None,
+                "chg24": round(s.change_24h_pct, 2) if s.change_24h_pct else None,
                 "vol": round(s.volume_24h, 0) if s.volume_24h else None,
-                "mcap": s.market_cap,
+                "spread": round(s.spread, 4) if s.spread else None,
             }
 
-            # Include compact technicals
-            ta = meta.get("technical", {})
-            if ta:
+            ta_summary = meta.get("technical_summary")
+            if ta_summary:
                 entry["ta"] = {
-                    "rsi": ta.get("rsi_14"),
-                    "trend": ta.get("trend"),
-                    "sma50_dist": ta.get("sma50_distance_pct"),
+                    "trend": ta_summary.get("trend"),
+                    "rsi": ta_summary.get("rsi_14"),
+                    "vol_trend": ta_summary.get("volume_trend"),
                 }
 
-            # Include compact fundamentals
-            fund = meta.get("fundamentals", {})
-            if fund:
-                entry["fund"] = {
-                    "pe": fund.get("pe_ratio"),
-                    "ps": fund.get("ps_ratio"),
-                    "roe": fund.get("roe"),
+            fundamentals = meta.get("fundamentals")
+            if fundamentals:
+                entry["fun"] = {
+                    "pe": fundamentals.get("pe_ratio"),
+                    "rev_growth": fundamentals.get("revenue_growth"),
                 }
 
-            # Include macro regime
-            macro = meta.get("macro", {})
+            macro = meta.get("macro")
             if macro:
                 entry["macro"] = macro.get("regime")
 
@@ -235,106 +229,116 @@ class StockStrategy:
         return compressed
 
     # ------------------------------------------------------------------
-    # Technical analysis helpers
+    # Technical indicator helpers
     # ------------------------------------------------------------------
 
-    def _compute_technicals(self, bars: list[dict[str, Any]]) -> dict[str, Any]:
-        """Compute technical indicators from bar data."""
+    def _summarize_bars(self, bars: list[dict[str, Any]]) -> dict[str, Any]:
+        """Compute a compact summary from OHLCV bar data."""
         if not bars or len(bars) < 2:
             return {}
 
-        closes = [b.get("close", 0) for b in bars if b.get("close")]
-        volumes = [b.get("volume", 0) for b in bars if b.get("volume")]
+        closes = [b["close"] for b in bars if "close" in b]
+        volumes = [b.get("volume", 0) for b in bars]
+        highs = [b.get("high", 0) for b in bars]
+        lows = [b.get("low", 0) for b in bars]
 
         if not closes:
             return {}
 
         current = closes[-1]
-        result: dict[str, Any] = {}
+        sma_20 = sum(closes[-20:]) / min(len(closes), 20) if len(closes) >= 2 else current
+        sma_50 = sum(closes[-50:]) / min(len(closes), 50) if len(closes) >= 2 else current
 
-        # SMAs
-        if len(closes) >= 20:
-            sma_20 = sum(closes[-20:]) / 20
-            result["sma_20"] = round(sma_20, 2)
-            result["sma20_distance_pct"] = round(
-                (current - sma_20) / sma_20 * 100, 2
-            ) if sma_20 > 0 else 0
+        # ATR approximation
+        true_ranges = []
+        for i in range(1, len(bars)):
+            h, l, prev_c = highs[i], lows[i], closes[i - 1]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            true_ranges.append(tr)
+        atr = sum(true_ranges[-14:]) / min(len(true_ranges), 14) if true_ranges else 0
 
-        if len(closes) >= 50:
-            sma_50 = sum(closes[-50:]) / 50
-            result["sma_50"] = round(sma_50, 2)
-            result["sma50_distance_pct"] = round(
-                (current - sma_50) / sma_50 * 100, 2
-            ) if sma_50 > 0 else 0
-
-        # Trend
-        sma_20 = result.get("sma_20", current)
-        sma_50 = result.get("sma_50", current)
+        # Trend detection
+        trend = "neutral"
         if current > sma_20 > sma_50:
-            result["trend"] = "bullish"
+            trend = "bullish"
         elif current < sma_20 < sma_50:
-            result["trend"] = "bearish"
-        else:
-            result["trend"] = "neutral"
-
-        # RSI (14-period)
-        if len(closes) >= 15:
-            gains = []
-            losses = []
-            for i in range(1, len(closes)):
-                delta = closes[i] - closes[i - 1]
-                gains.append(max(delta, 0))
-                losses.append(max(-delta, 0))
-
-            if len(gains) >= 14:
-                avg_gain = sum(gains[-14:]) / 14
-                avg_loss = sum(losses[-14:]) / 14
-                if avg_loss > 0:
-                    rs = avg_gain / avg_loss
-                    rsi = 100 - (100 / (1 + rs))
-                else:
-                    rsi = 100.0
-                result["rsi_14"] = round(rsi, 2)
+            trend = "bearish"
 
         # Volume trend
-        if len(volumes) >= 20:
-            recent_vol = sum(volumes[-5:]) / 5
-            older_vol = sum(volumes[-20:-5]) / 15 if len(volumes) >= 20 else recent_vol
-            if older_vol > 0:
-                result["volume_ratio"] = round(recent_vol / older_vol, 2)
-                result["volume_trend"] = (
-                    "rising" if recent_vol > older_vol * 1.2
-                    else "falling" if recent_vol < older_vol * 0.8
-                    else "stable"
-                )
+        recent_vol = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
+        older_vol = sum(volumes[-20:-5]) / 15 if len(volumes) >= 20 else recent_vol
+        volume_trend = "rising" if recent_vol > older_vol * 1.2 else (
+            "falling" if recent_vol < older_vol * 0.8 else "stable"
+        )
 
-        return result
+        return {
+            "sma_20": round(sma_20, 2),
+            "sma_50": round(sma_50, 2),
+            "atr": round(atr, 2),
+            "atr_pct": round(atr / current * 100, 2) if current > 0 else 0,
+            "trend": trend,
+            "volume_trend": volume_trend,
+            "bar_count": len(bars),
+        }
 
-    def _find_peers(
-        self,
-        symbol: str,
-        snapshots: list[MarketSnapshot],
-    ) -> list[dict[str, Any]]:
-        """Find peer stocks for comparison.
+    def _compute_technical_indicators(
+        self, bars: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Compute technical indicators for analyst context."""
+        summary = self._summarize_bars(bars)
+        if not summary or not bars:
+            return summary
 
-        Groups stocks by sector/category from snapshot metadata.
-        """
-        target = next((s for s in snapshots if s.symbol == symbol), None)
-        if target is None:
-            return []
+        closes = [b["close"] for b in bars if "close" in b]
+        if len(closes) < 14:
+            return summary
 
-        target_category = target.metadata.get("sector") or target.metadata.get("category")
+        # RSI (14-period)
+        gains: list[float] = []
+        losses: list[float] = []
+        for i in range(1, len(closes)):
+            delta = closes[i] - closes[i - 1]
+            gains.append(max(delta, 0))
+            losses.append(max(-delta, 0))
 
-        peers: list[dict[str, Any]] = []
-        for s in snapshots:
-            if s.symbol == symbol:
-                continue
-            s_category = s.metadata.get("sector") or s.metadata.get("category")
-            if target_category and s_category == target_category:
-                peers.append({
-                    "symbol": s.symbol,
-                    "price": s.price,
-                    "change_24h": s.change_24h_pct,
-                })
+        if len(gains) >= 14:
+            avg_gain = sum(gains[-14:]) / 14
+            avg_loss = sum(losses[-14:]) / 14
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            else:
+                rsi = 100.0
+            summary["rsi_14"] = round(rsi, 2)
 
-        return peers[:5]
+        # MACD approximation (12, 26, 9)
+        if len(closes) >= 26:
+            ema_12 = self._ema(closes, 12)
+            ema_26 = self._ema(closes, 26)
+            macd_line = ema_12 - ema_26
+            summary["macd"] = round(macd_line, 4)
+            summary["macd_signal"] = "bullish" if macd_line > 0 else "bearish"
+
+        # Bollinger Bands (20, 2)
+        if len(closes) >= 20:
+            sma_20 = sum(closes[-20:]) / 20
+            variance = sum((c - sma_20) ** 2 for c in closes[-20:]) / 20
+            std_dev = variance ** 0.5
+            summary["bb_upper"] = round(sma_20 + 2 * std_dev, 2)
+            summary["bb_lower"] = round(sma_20 - 2 * std_dev, 2)
+            summary["bb_width_pct"] = (
+                round(4 * std_dev / sma_20 * 100, 2) if sma_20 > 0 else 0
+            )
+
+        return summary
+
+    @staticmethod
+    def _ema(values: list[float], period: int) -> float:
+        """Compute Exponential Moving Average of the last *period* values."""
+        if not values:
+            return 0.0
+        k = 2.0 / (period + 1)
+        ema = values[0]
+        for v in values[1:]:
+            ema = v * k + ema * (1 - k)
+        return ema

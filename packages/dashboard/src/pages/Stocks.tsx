@@ -2,7 +2,9 @@ import { useState } from "react";
 import { useTraderPortfolio } from "../hooks/usePortfolio";
 import { useTrades, useTradeDetail } from "../hooks/useTrades";
 import TradeTable from "../components/TradeTable";
-import type { Trade } from "../lib/types";
+import TraderCard from "../components/TraderCard";
+import PortfolioChart from "../components/PortfolioChart";
+import type { PortfolioSnapshot, Trade } from "../lib/types";
 import {
   BarChart,
   Bar,
@@ -11,197 +13,194 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  Cell,
 } from "recharts";
 
 export default function Stocks() {
-  const { data: portfolio } = useTraderPortfolio("stocks", 30);
-  const { data: tradesData } = useTrades({
-    trader: "stocks",
-    since_hours: 168,
-    limit: 200,
-  });
+  const { data: traderData, isLoading } = useTraderPortfolio("stocks", 14);
+  const { data: tradesData } = useTrades({ trader: "stocks", limit: 50 });
   const [selectedTrade, setSelectedTrade] = useState<Trade | null>(null);
   const { data: tradeDetail } = useTradeDetail(selectedTrade?.id ?? null);
 
-  const dailyPerf = portfolio?.daily_performance ?? [];
-  const chartData = dailyPerf.map((d) => ({
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-96">
+        <div className="text-terminal-muted animate-pulse">Loading Stocks data...</div>
+      </div>
+    );
+  }
+
+  const summary = traderData?.summary;
+  const dailyPerf = traderData?.daily_performance ?? [];
+  const openTrades = traderData?.open_trades ?? [];
+  const allTrades = tradesData?.trades ?? [];
+
+  const history: PortfolioSnapshot[] = dailyPerf.map((d) => ({
+    time: d.date,
+    total_capital: d.net_pnl,
+    polymarket_capital: null,
+    crypto_capital: null,
+    stocks_capital: d.net_pnl,
+  }));
+
+  const dailyPnlData = dailyPerf.map((d) => ({
     date: d.date.slice(5),
     pnl: d.net_pnl,
-    wins: d.winning_trades,
-    losses: d.losing_trades,
+    winRate: d.win_rate ?? 0,
   }));
 
   return (
     <div className="space-y-6">
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-bold">Stocks & Options</h1>
-          <p className="text-terminal-muted text-sm">
-            Equity positions, options flow, and earnings calendar
-          </p>
+          <h2 className="text-xl font-bold">Stocks</h2>
+          <p className="text-sm text-terminal-muted">Stock positions and options flow</p>
         </div>
-        {portfolio && (
-          <div className="flex items-center gap-6">
-            <div className="text-right">
-              <div className="stat-label">Total P&L</div>
+        <div className="flex items-center gap-4">
+          <span className="badge badge-blue">{openTrades.length} open positions</span>
+          {summary && (
+            <span
+              className={`text-sm font-bold tabular-nums ${
+                summary.total_pnl >= 0 ? "text-terminal-green" : "text-terminal-red"
+              }`}
+            >
+              {summary.total_pnl >= 0 ? "+" : ""}${summary.total_pnl.toFixed(2)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Summary + Equity Curve */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div>
+          {summary && (
+            <TraderCard
+              trader="stocks"
+              summary={summary}
+              todayPerformance={dailyPerf[dailyPerf.length - 1]}
+              openTradesCount={openTrades.length}
+            />
+          )}
+          {/* Performance Stats */}
+          <div className="card mt-4">
+            <div className="card-header">Performance</div>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-terminal-muted">Win Rate</span>
+                <span className="tabular-nums">
+                  {summary?.win_rate_pct.toFixed(1) ?? "0"}%
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-terminal-muted">Total Trades</span>
+                <span className="tabular-nums">{summary?.total_trades ?? 0}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-terminal-muted">Wins / Losses</span>
+                <span className="tabular-nums">
+                  <span className="text-terminal-green">{summary?.total_wins ?? 0}</span>
+                  {" / "}
+                  <span className="text-terminal-red">{summary?.total_losses ?? 0}</span>
+                </span>
+              </div>
+              <div className="flex justify-between border-t border-terminal-border pt-2">
+                <span className="text-terminal-muted">Sharpe Ratio (latest)</span>
+                <span className="tabular-nums">
+                  {dailyPerf[dailyPerf.length - 1]?.sharpe_ratio?.toFixed(2) ?? "N/A"}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="lg:col-span-2">
+          <PortfolioChart history={history} height={300} />
+        </div>
+      </div>
+
+      {/* Daily P&L Chart */}
+      <div className="card">
+        <div className="card-header">Daily P&L</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={dailyPnlData}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+            <XAxis dataKey="date" stroke="#6b7280" fontSize={10} tickLine={false} />
+            <YAxis
+              stroke="#6b7280"
+              fontSize={10}
+              tickLine={false}
+              tickFormatter={(v: number) => `$${v.toFixed(0)}`}
+            />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: "#111827",
+                border: "1px solid #1f2937",
+                borderRadius: "8px",
+                fontSize: "12px",
+              }}
+              formatter={(value: number, name: string) => [
+                `$${value.toFixed(4)}`,
+                name === "pnl" ? "Net P&L" : "Win Rate",
+              ]}
+            />
+            <Bar dataKey="pnl" name="Net P&L" radius={[2, 2, 0, 0]} fill="#2979ff" />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Open Positions */}
+      {openTrades.length > 0 && (
+        <div className="card">
+          <div className="card-header">Open Positions</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {openTrades.map((trade: Trade) => (
               <div
-                className={`text-lg font-bold tabular-nums ${
-                  portfolio.summary.total_pnl >= 0
-                    ? "text-terminal-green"
-                    : "text-terminal-red"
-                }`}
+                key={trade.id}
+                className="bg-terminal-bg border border-terminal-border rounded-lg p-3 hover:border-gray-600 transition-colors cursor-pointer"
+                onClick={() => setSelectedTrade(trade)}
               >
-                {portfolio.summary.total_pnl >= 0 ? "+" : ""}$
-                {portfolio.summary.total_pnl.toFixed(2)}
-              </div>
-            </div>
-            <div className="text-right">
-              <div className="stat-label">Win Rate</div>
-              <div className="text-lg font-bold tabular-nums">
-                {portfolio.summary.win_rate_pct.toFixed(1)}%
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Stats row */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="card">
-          <div className="stat-label">Open Positions</div>
-          <div className="stat-value">{portfolio?.open_trades.length ?? 0}</div>
-        </div>
-        <div className="card">
-          <div className="stat-label">Total Trades</div>
-          <div className="stat-value">{portfolio?.summary.total_trades ?? 0}</div>
-        </div>
-        <div className="card">
-          <div className="stat-label">Win / Loss</div>
-          <div className="stat-value text-lg">
-            <span className="text-terminal-green">{portfolio?.summary.total_wins ?? 0}</span>
-            <span className="text-terminal-muted mx-1">/</span>
-            <span className="text-terminal-red">{portfolio?.summary.total_losses ?? 0}</span>
-          </div>
-        </div>
-        <div className="card">
-          <div className="stat-label">Today Fees</div>
-          <div className="stat-value text-lg text-terminal-amber">
-            ${dailyPerf.length > 0
-              ? dailyPerf[dailyPerf.length - 1]!.total_trading_fees.toFixed(4)
-              : "0.00"}
-          </div>
-        </div>
-      </div>
-
-      {/* Open positions */}
-      {portfolio && portfolio.open_trades.length > 0 && (
-        <div className="card">
-          <div className="card-header">
-            Open Positions ({portfolio.open_trades.length})
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-terminal-muted text-xs uppercase tracking-wider border-b border-terminal-border">
-                  <th className="text-left py-2 px-2">Asset</th>
-                  <th className="text-left py-2 px-2">Direction</th>
-                  <th className="text-right py-2 px-2">Size</th>
-                  <th className="text-right py-2 px-2">Entry</th>
-                  <th className="text-right py-2 px-2">Stop Loss</th>
-                  <th className="text-right py-2 px-2">Take Profit</th>
-                  <th className="text-right py-2 px-2">Opened</th>
-                </tr>
-              </thead>
-              <tbody>
-                {portfolio.open_trades.map((t) => (
-                  <tr
-                    key={t.id}
-                    className="table-row cursor-pointer"
-                    onClick={() => setSelectedTrade(t)}
+                <div className="flex items-center justify-between mb-2">
+                  <span className="font-medium text-sm">{trade.asset}</span>
+                  <span
+                    className={`badge ${
+                      trade.direction === "buy" ? "badge-green" : "badge-red"
+                    }`}
                   >
-                    <td className="py-2 px-2 font-medium">{t.asset}</td>
-                    <td className="py-2 px-2">
-                      <span
-                        className={`text-xs font-semibold ${
-                          t.direction === "long"
-                            ? "text-terminal-green"
-                            : "text-terminal-red"
-                        }`}
-                      >
-                        {t.direction.toUpperCase()}
-                      </span>
-                    </td>
-                    <td className="py-2 px-2 text-right tabular-nums">
-                      ${t.position_size_usd.toFixed(2)}
-                    </td>
-                    <td className="py-2 px-2 text-right tabular-nums text-xs">
-                      {t.entry_price?.toFixed(2) ?? "-"}
-                    </td>
-                    <td className="py-2 px-2 text-right tabular-nums text-xs text-terminal-red">
-                      {t.stop_loss?.toFixed(2) ?? "-"}
-                    </td>
-                    <td className="py-2 px-2 text-right tabular-nums text-xs text-terminal-green">
-                      {t.take_profit?.toFixed(2) ?? "-"}
-                    </td>
-                    <td className="py-2 px-2 text-right text-xs text-terminal-muted">
-                      {t.opened_at
-                        ? new Date(t.opened_at).toLocaleDateString()
-                        : "-"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                    {trade.direction.toUpperCase()}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div>
+                    <span className="text-terminal-muted">Size:</span>{" "}
+                    <span className="tabular-nums">${trade.position_size_usd.toFixed(2)}</span>
+                  </div>
+                  <div>
+                    <span className="text-terminal-muted">Entry:</span>{" "}
+                    <span className="tabular-nums">{trade.entry_price?.toFixed(2) ?? "-"}</span>
+                  </div>
+                  <div>
+                    <span className="text-terminal-muted">SL:</span>{" "}
+                    <span className="tabular-nums text-terminal-red">
+                      {trade.stop_loss?.toFixed(2) ?? "-"}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-terminal-muted">TP:</span>{" "}
+                    <span className="tabular-nums text-terminal-green">
+                      {trade.take_profit?.toFixed(2) ?? "-"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}
 
-      {/* Daily P&L chart */}
-      {chartData.length > 0 && (
-        <div className="card">
-          <div className="card-header">Daily P&L</div>
-          <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-              <XAxis dataKey="date" stroke="#6b7280" fontSize={10} tickLine={false} />
-              <YAxis
-                stroke="#6b7280"
-                fontSize={10}
-                tickLine={false}
-                tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-              />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: "#111827",
-                  border: "1px solid #1f2937",
-                  borderRadius: "8px",
-                  fontSize: "12px",
-                }}
-                formatter={(value: number, name: string) => [
-                  `$${value.toFixed(2)}`,
-                  name === "pnl" ? "Net P&L" : name,
-                ]}
-              />
-              <Bar dataKey="pnl" radius={[2, 2, 0, 0]}>
-                {chartData.map((entry, idx) => (
-                  <Cell
-                    key={idx}
-                    fill={entry.pnl >= 0 ? "#00e676" : "#ff1744"}
-                    fillOpacity={0.7}
-                  />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-
-      {/* Trade detail */}
+      {/* Trade Detail Panel */}
       {selectedTrade && tradeDetail && (
         <div className="card border-terminal-blue/30">
           <div className="flex items-center justify-between mb-3">
-            <div className="card-header mb-0">Trade Detail: {tradeDetail.asset}</div>
+            <div className="card-header mb-0">Trade Detail</div>
             <button
               onClick={() => setSelectedTrade(null)}
               className="text-terminal-muted hover:text-gray-300 text-xs"
@@ -209,22 +208,10 @@ export default function Stocks() {
               Close
             </button>
           </div>
-          <div className="grid grid-cols-4 gap-4 text-sm">
+          <div className="grid grid-cols-4 gap-4 text-sm mb-4">
             <div>
-              <span className="text-terminal-muted text-xs">Direction:</span>
-              <div className="font-medium capitalize">{tradeDetail.direction}</div>
-            </div>
-            <div>
-              <span className="text-terminal-muted text-xs">P&L:</span>
-              <div
-                className={`font-bold tabular-nums ${
-                  (tradeDetail.net_pnl ?? 0) >= 0
-                    ? "text-terminal-green"
-                    : "text-terminal-red"
-                }`}
-              >
-                ${tradeDetail.net_pnl?.toFixed(2) ?? "-"}
-              </div>
+              <span className="text-terminal-muted text-xs">Asset:</span>
+              <div className="font-medium">{tradeDetail.asset}</div>
             </div>
             <div>
               <span className="text-terminal-muted text-xs">Confidence:</span>
@@ -235,20 +222,40 @@ export default function Stocks() {
               </div>
             </div>
             <div>
-              <span className="text-terminal-muted text-xs">Close Reason:</span>
-              <div className="font-medium text-xs capitalize">
-                {tradeDetail.close_reason?.replace(/_/g, " ") ?? "Open"}
+              <span className="text-terminal-muted text-xs">Model:</span>
+              <div className="font-medium text-xs">{tradeDetail.ai_model_used ?? "-"}</div>
+            </div>
+            <div>
+              <span className="text-terminal-muted text-xs">AI Cost:</span>
+              <div className="font-medium tabular-nums text-terminal-amber">
+                ${tradeDetail.total_cost?.toFixed(4) ?? "-"}
               </div>
             </div>
           </div>
+          {tradeDetail.ai_decisions && tradeDetail.ai_decisions.length > 0 && (
+            <div>
+              <div className="text-xs text-terminal-muted mb-2">AI Reasoning:</div>
+              {tradeDetail.ai_decisions.map((d) => (
+                <div key={d.id} className="mb-2">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="badge badge-blue">{d.decision_type}</span>
+                    <span className="text-xs text-terminal-muted">{d.model}</span>
+                  </div>
+                  <pre className="bg-terminal-bg border border-terminal-border rounded p-2 text-xs text-gray-300 overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">
+                    {d.output_raw ?? d.input_summary ?? "No output"}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
-      {/* Trade history */}
+      {/* Trade History */}
       <div className="card">
         <div className="card-header">Trade History</div>
         <TradeTable
-          trades={tradesData?.trades ?? []}
+          trades={allTrades}
           showTrader={false}
           onSelectTrade={setSelectedTrade}
         />

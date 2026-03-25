@@ -28,9 +28,9 @@ from packages.core.risk.drawdown_monitor import DrawdownMonitor
 from packages.core.risk.frequency_limiter import FrequencyLimiter
 from packages.core.risk.manager import RiskManager
 from packages.trader_stocks.executor import StockExecutor
+from packages.trader_stocks.feeds.market_feed import MarketFeed
 from packages.trader_stocks.feeds.fundamentals_feed import FundamentalsFeed
 from packages.trader_stocks.feeds.macro_feed import MacroFeed
-from packages.trader_stocks.feeds.market_feed import MarketFeed
 from packages.trader_stocks.strategy import StockStrategy
 
 logger = structlog.get_logger(__name__)
@@ -39,18 +39,18 @@ logger = structlog.get_logger(__name__)
 class StockTrader(BaseTrader):
     """Stock-specific trader implementation.
 
-    Wires together market data, fundamentals, and macro feeds with
-    the stock strategy preprocessor to implement the abstract methods
+    Wires together market feeds, fundamentals, macro data, and the
+    stock strategy preprocessor to implement the abstract methods
     required by :class:`BaseTrader`.
 
     Parameters
     ----------
     market_feed:
-        Real-time stock market data feed (Alpaca/Polygon).
+        Real-time stock market data feed (prices, quotes, bars).
     fundamentals_feed:
-        Fundamental data feed (earnings, SEC filings, ratios).
+        Fundamentals data feed (earnings, SEC filings, ratios).
     macro_feed:
-        Macroeconomic data feed (FRED indicators).
+        Macroeconomic data feed (FRED API indicators).
     strategy:
         Stock strategy preprocessor for building AI contexts.
     **kwargs:
@@ -84,11 +84,13 @@ class StockTrader(BaseTrader):
     async def collect_market_data(self) -> list[MarketSnapshot]:
         """Gather stock market data from all configured feeds.
 
-        Collects price data, fundamentals, and macro indicators
-        in parallel, then builds enriched market snapshots.
+        Collects data in parallel from market, fundamentals, and macro
+        feeds, then builds enriched :class:`MarketSnapshot` objects
+        via the :class:`StockStrategy`.
         """
         log = logger.bind(trader=self.trader_name)
 
+        # Parallel data collection
         await asyncio.gather(
             self._collect_market_data(),
             self._collect_fundamentals_data(),
@@ -101,7 +103,7 @@ class StockTrader(BaseTrader):
             snapshots=len(self._current_snapshots),
             bars_symbols=len(self._current_bars),
             fundamentals_symbols=len(self._current_fundamentals),
-            macro_regime=self._current_macro.get("regime", "unknown"),
+            has_macro=bool(self._current_macro),
         )
 
         return self._current_snapshots
@@ -109,8 +111,8 @@ class StockTrader(BaseTrader):
     def build_full_context(self, opportunity: Opportunity) -> dict[str, Any]:
         """Assemble the full context for Opus analyst evaluation.
 
-        Includes price data, technicals, fundamentals, macro context,
-        and portfolio state.
+        Delegates to :class:`StockStrategy` which combines all
+        available data sources into a structured context dict.
         """
         recent_trades = [
             {
@@ -131,7 +133,7 @@ class StockTrader(BaseTrader):
             recent_trades=recent_trades,
             bars_data=self._current_bars,
             fundamentals_data=self._current_fundamentals,
-            macro_data=self._current_macro,
+            macro_summary=self._current_macro,
         )
 
     # ------------------------------------------------------------------
@@ -150,27 +152,25 @@ class StockTrader(BaseTrader):
                     self._current_bars[symbol] = bars
 
         except Exception:
-            logger.exception("stock_market_data_failed")
+            logger.exception("stock_market_data_collection_failed")
             self._current_snapshots = []
 
     async def _collect_fundamentals_data(self) -> None:
         """Fetch fundamentals for all tracked symbols."""
         try:
-            for symbol in self.fundamentals_feed.symbols:
+            for symbol in self.market_feed.symbols:
                 fundamentals = self.fundamentals_feed.get_fundamentals(symbol)
-                if fundamentals:
-                    self._current_fundamentals[symbol] = fundamentals
-
                 earnings = self.fundamentals_feed.get_earnings(symbol)
-                if earnings:
-                    self._current_fundamentals.setdefault(symbol, {})
-                    self._current_fundamentals[symbol]["earnings"] = earnings
-
+                if fundamentals or earnings:
+                    self._current_fundamentals[symbol] = {
+                        **fundamentals,
+                        "earnings": earnings,
+                    }
         except Exception:
             logger.exception("fundamentals_data_collection_failed")
 
     async def _collect_macro_data(self) -> None:
-        """Fetch macro indicators and regime."""
+        """Fetch macro environment summary."""
         try:
             self._current_macro = self.macro_feed.get_macro_summary()
         except Exception:
@@ -184,6 +184,7 @@ class StockTrader(BaseTrader):
         """Start the stock trader: connect feeds, then run the loop."""
         log = logger.bind(trader=self.trader_name)
 
+        # Connect all feeds
         log.info("connecting_stock_feeds")
         await asyncio.gather(
             self.market_feed.connect(),
@@ -192,14 +193,17 @@ class StockTrader(BaseTrader):
             return_exceptions=True,
         )
 
+        # Initialize executor
         if isinstance(self.executor, StockExecutor):
             await self.executor.initialize()
 
         log.info("stock_feeds_connected")
+
+        # Run the trading loop
         await super().start(interval_seconds)
 
     async def stop(self) -> None:
-        """Stop the stock trader and disconnect feeds."""
+        """Stop the stock trader and disconnect all feeds."""
         await super().stop()
 
         await asyncio.gather(
@@ -224,14 +228,15 @@ async def run_stock_trader(
     config: SystemConfig | None = None,
     trader_config: TraderConfig | None = None,
 ) -> None:
-    """Entry point: wire up dependencies and run the stock trader.
+    """Entry point: wire up all dependencies and run the stock trader.
 
     Parameters
     ----------
     config:
-        System configuration. Loaded from config.yaml / .env if not provided.
+        System configuration.  Loaded from config.yaml / .env if not
+        provided.
     trader_config:
-        Trader-specific configuration. Uses sensible stock defaults
+        Trader-specific configuration.  Uses sensible stock defaults
         if not provided.
     """
     config = config or SystemConfig()
@@ -241,10 +246,10 @@ async def run_stock_trader(
         markets=[Market.STOCKS],
         initial_balance=config.goal.starting_capital,
         target_balance=config.goal.target_capital,
-        screener_interval_minutes=30,
+        screener_interval_minutes=15,
         default_leverage=1.0,
-        default_stop_loss_pct=0.07,
-        default_take_profit_pct=0.15,
+        default_stop_loss_pct=0.05,
+        default_take_profit_pct=0.10,
     )
 
     # --- Feeds ---
@@ -254,7 +259,7 @@ async def run_stock_trader(
         alpaca_base_url=config.market.alpaca_base_url,
         symbols=[
             "SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
-            "META", "TSLA", "AMD", "NFLX", "CRM",
+            "META", "TSLA", "AMD",
         ],
         poll_interval_seconds=60,
     )
@@ -278,6 +283,7 @@ async def run_stock_trader(
         api_key=config.market.alpaca_api_key,
         api_secret=config.market.alpaca_api_secret,
         base_url=config.market.alpaca_base_url,
+        default_order_type="market",
     )
 
     # --- AI ---
@@ -338,7 +344,6 @@ async def run_stock_trader(
         "stock_trader_starting",
         initial_balance=trader_config.initial_balance,
         mode=trader_config.mode,
-        paper="paper" in config.market.alpaca_base_url,
     )
 
     try:

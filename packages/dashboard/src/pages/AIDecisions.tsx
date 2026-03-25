@@ -1,61 +1,92 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { getAIDecisions, getLatestStrategistPlan } from "../lib/api";
+import { getAIDecisions } from "../lib/api";
 import AIReasoningPanel from "../components/AIReasoningPanel";
 
-export default function AIDecisions() {
-  const [decisionType, setDecisionType] = useState<string>("");
-  const [trader, setTrader] = useState<string>("");
-  const [sinceHours, setSinceHours] = useState(24);
 
-  const { data: decisionsData, isLoading } = useQuery({
-    queryKey: ["ai-decisions", decisionType, trader, sinceHours],
+const DECISION_TYPES: { value: string; label: string }[] = [
+  { value: "", label: "All Types" },
+  { value: "screener", label: "Screener" },
+  { value: "analyst", label: "Analyst" },
+  { value: "strategist", label: "Strategist" },
+];
+
+const TRADERS: { value: string; label: string }[] = [
+  { value: "", label: "All Traders" },
+  { value: "polymarket", label: "Polymarket" },
+  { value: "crypto", label: "Crypto" },
+  { value: "stocks", label: "Stocks" },
+];
+
+const TIME_RANGES: { value: number; label: string }[] = [
+  { value: 1, label: "1 Hour" },
+  { value: 6, label: "6 Hours" },
+  { value: 24, label: "24 Hours" },
+  { value: 72, label: "3 Days" },
+  { value: 168, label: "7 Days" },
+];
+
+export default function AIDecisions() {
+  const [decisionType, setDecisionType] = useState("");
+  const [trader, setTrader] = useState("");
+  const [sinceHours, setSinceHours] = useState(24);
+  const [limit, setLimit] = useState(100);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["ai-decisions", decisionType, trader, sinceHours, limit],
     queryFn: () =>
       getAIDecisions({
         decision_type: decisionType || undefined,
         trader: trader || undefined,
         since_hours: sinceHours,
-        limit: 100,
+        limit,
       }),
     refetchInterval: 15_000,
   });
 
-  const { data: strategistData } = useQuery({
-    queryKey: ["strategist-latest"],
-    queryFn: getLatestStrategistPlan,
-    refetchInterval: 60_000,
-  });
+  const decisions = data?.decisions ?? [];
 
-  const decisions = decisionsData?.decisions ?? [];
-  const totalCost = decisions.reduce((sum, d) => sum + d.cost_usd, 0);
+  // Compute summary stats
+  const totalCost = decisions.reduce((s, d) => s + d.cost_usd, 0);
+  const avgLatency =
+    decisions.length > 0
+      ? decisions.reduce((s, d) => s + d.latency_ms, 0) / decisions.length
+      : 0;
   const totalTokens = decisions.reduce(
-    (sum, d) => sum + d.prompt_tokens + d.completion_tokens,
+    (s, d) => s + d.prompt_tokens + d.completion_tokens,
     0
   );
 
+  const typeCounts = decisions.reduce<Record<string, number>>((acc, d) => {
+    acc[d.decision_type] = (acc[d.decision_type] ?? 0) + 1;
+    return acc;
+  }, {});
+
   return (
     <div className="space-y-6">
+      {/* Header */}
       <div>
-        <h1 className="text-xl font-bold">AI Decisions</h1>
-        <p className="text-terminal-muted text-sm">
-          Full audit trail of all AI inference calls with reasoning
+        <h2 className="text-xl font-bold">AI Decisions</h2>
+        <p className="text-sm text-terminal-muted">
+          Audit trail of all AI inference calls with reasoning
         </p>
       </div>
 
       {/* Filters */}
       <div className="card">
-        <div className="flex flex-wrap gap-4 items-end">
+        <div className="flex flex-wrap items-center gap-4">
           <div>
             <label className="text-xs text-terminal-muted block mb-1">Type</label>
             <select
               value={decisionType}
               onChange={(e) => setDecisionType(e.target.value)}
-              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-terminal-blue"
+              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-terminal-blue"
             >
-              <option value="">All Types</option>
-              <option value="screener">Screener</option>
-              <option value="analyst">Analyst</option>
-              <option value="strategist">Strategist</option>
+              {DECISION_TYPES.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
             </select>
           </div>
           <div>
@@ -63,112 +94,85 @@ export default function AIDecisions() {
             <select
               value={trader}
               onChange={(e) => setTrader(e.target.value)}
-              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-terminal-blue"
+              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-terminal-blue"
             >
-              <option value="">All Traders</option>
-              <option value="polymarket">Polymarket</option>
-              <option value="crypto">Crypto</option>
-              <option value="stocks">Stocks</option>
+              {TRADERS.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
             </select>
           </div>
           <div>
-            <label className="text-xs text-terminal-muted block mb-1">
-              Time Window
-            </label>
+            <label className="text-xs text-terminal-muted block mb-1">Time Range</label>
             <select
               value={sinceHours}
               onChange={(e) => setSinceHours(Number(e.target.value))}
-              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-terminal-blue"
+              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-terminal-blue"
             >
-              <option value={1}>Last hour</option>
-              <option value={6}>Last 6 hours</option>
-              <option value={24}>Last 24 hours</option>
-              <option value={72}>Last 3 days</option>
-              <option value={168}>Last 7 days</option>
+              {TIME_RANGES.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
             </select>
           </div>
-          <div className="flex-1" />
-          <div className="flex gap-4 text-xs">
-            <div>
-              <span className="text-terminal-muted">Decisions:</span>{" "}
-              <span className="font-semibold tabular-nums">{decisions.length}</span>
-            </div>
-            <div>
-              <span className="text-terminal-muted">Total Cost:</span>{" "}
-              <span className="font-semibold tabular-nums text-terminal-amber">
-                ${totalCost.toFixed(4)}
-              </span>
-            </div>
-            <div>
-              <span className="text-terminal-muted">Tokens:</span>{" "}
-              <span className="font-semibold tabular-nums">
-                {totalTokens.toLocaleString()}
-              </span>
-            </div>
+          <div>
+            <label className="text-xs text-terminal-muted block mb-1">Limit</label>
+            <select
+              value={limit}
+              onChange={(e) => setLimit(Number(e.target.value))}
+              className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-terminal-blue"
+            >
+              {[25, 50, 100, 200, 500].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
       </div>
 
-      {/* Latest strategist plan */}
-      {strategistData?.plan && (
-        <div className="card border-terminal-green/20">
-          <div className="card-header flex items-center justify-between">
-            <span>Latest Strategist Plan</span>
-            <span className="text-xs text-terminal-muted normal-case tracking-normal">
-              {new Date(strategistData.plan.created_at).toLocaleString()}
-            </span>
-          </div>
-          <div className="grid grid-cols-4 gap-4 text-sm mb-3">
-            <div>
-              <span className="text-terminal-muted text-xs">Daily Target:</span>
-              <div className="font-bold text-terminal-green tabular-nums">
-                ${strategistData.plan.daily_target.toFixed(2)}
-              </div>
-            </div>
-            <div>
-              <span className="text-terminal-muted text-xs">Feasibility:</span>
-              <div className="font-bold tabular-nums">
-                {strategistData.plan.goal_feasibility
-                  ? `${(strategistData.plan.goal_feasibility * 100).toFixed(0)}%`
-                  : "-"}
-              </div>
-            </div>
-            <div>
-              <span className="text-terminal-muted text-xs">Inference Cost:</span>
-              <div className="font-bold text-terminal-amber tabular-nums">
-                ${strategistData.plan.inference_cost?.toFixed(4) ?? "-"}
-              </div>
-            </div>
-            <div>
-              <span className="text-terminal-muted text-xs">Allocations:</span>
-              <div className="text-xs font-medium">
-                {Object.entries(strategistData.plan.allocations ?? {}).map(
-                  ([k, v]) => (
-                    <span key={k} className="mr-2 capitalize">
-                      {k}: {typeof v === "number" ? `${(v * 100).toFixed(0)}%` : String(v)}
-                    </span>
-                  )
-                )}
-              </div>
-            </div>
-          </div>
-          {strategistData.plan.reasoning && (
-            <div>
-              <div className="text-xs text-terminal-muted mb-1">Reasoning:</div>
-              <pre className="bg-terminal-bg border border-terminal-border rounded p-3 text-xs text-gray-300 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
-                {strategistData.plan.reasoning}
-              </pre>
-            </div>
-          )}
+      {/* Summary Stats */}
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="card">
+          <div className="stat-label">Total Calls</div>
+          <div className="stat-value tabular-nums">{decisions.length}</div>
         </div>
-      )}
+        <div className="card">
+          <div className="stat-label">Total Cost</div>
+          <div className="stat-value tabular-nums text-terminal-amber">
+            ${totalCost.toFixed(4)}
+          </div>
+        </div>
+        <div className="card">
+          <div className="stat-label">Avg Latency</div>
+          <div className="stat-value tabular-nums">{avgLatency.toFixed(0)}ms</div>
+        </div>
+        <div className="card">
+          <div className="stat-label">Total Tokens</div>
+          <div className="stat-value tabular-nums">{totalTokens.toLocaleString()}</div>
+        </div>
+        <div className="card">
+          <div className="stat-label">By Type</div>
+          <div className="flex flex-wrap gap-2 mt-1">
+            {Object.entries(typeCounts).map(([type, count]) => (
+              <span key={type} className="badge badge-blue text-xs">
+                {type}: {count}
+              </span>
+            ))}
+            {Object.keys(typeCounts).length === 0 && (
+              <span className="text-terminal-muted text-xs">--</span>
+            )}
+          </div>
+        </div>
+      </div>
 
-      {/* Decision log */}
+      {/* Decision List */}
       {isLoading ? (
-        <div className="card flex items-center justify-center py-12">
-          <span className="text-terminal-muted animate-pulse">
-            Loading decisions...
-          </span>
+        <div className="flex items-center justify-center h-64">
+          <div className="text-terminal-muted animate-pulse">Loading decisions...</div>
         </div>
       ) : (
         <AIReasoningPanel decisions={decisions} />
