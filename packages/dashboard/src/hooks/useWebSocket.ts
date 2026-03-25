@@ -1,18 +1,28 @@
 /**
- * WebSocket hook for real-time event streaming from the trading system.
+ * Real-time event hook using Supabase Realtime subscriptions.
+ * Replaces the previous WebSocket-based implementation while
+ * exporting the same interface so pages don't need changes.
  */
 
-import { useEffect, useRef, useCallback, useState } from "react";
-import type { WSEvent, WSEventType } from "../lib/types";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { supabase } from "../lib/supabase";
+import type {
+  WSEvent,
+  WSEventType,
+  Trade,
+  PortfolioSnapshot,
+  AIDecision,
+} from "../lib/types";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 
 type EventHandler = (event: WSEvent) => void;
 
 interface UseWebSocketOptions {
-  /** Topics to subscribe to on connect (e.g. "trades", "portfolio") */
+  /** Topics to subscribe to (e.g. "trades", "portfolio") */
   topics?: string[];
-  /** Auto-reconnect on disconnect (default: true) */
+  /** Auto-reconnect on disconnect (default: true) — kept for API compat */
   reconnect?: boolean;
-  /** Reconnect delay in ms (default: 3000) */
+  /** Reconnect delay in ms — kept for API compat */
   reconnectDelay?: number;
   /** Specific event types to listen for */
   eventTypes?: WSEventType[];
@@ -26,89 +36,142 @@ interface UseWebSocketReturn {
   send: (data: Record<string, unknown>) => void;
 }
 
+/** Map a Supabase table + event type into our WSEvent format. */
+function toWSEvent(
+  table: string,
+  eventType: string,
+  newRow: Record<string, unknown>
+): WSEvent | null {
+  const timestamp = new Date().toISOString();
+
+  if (table === "trades") {
+    let event: WSEvent["event"];
+    if (eventType === "INSERT") event = "trade.opened";
+    else if (eventType === "UPDATE") {
+      const status = newRow.status as string | undefined;
+      event = status === "closed" ? "trade.closed" : "trade.updated";
+    } else if (eventType === "DELETE") {
+      event = "trade.updated";
+    } else {
+      return null;
+    }
+    return { event, data: newRow as unknown as Trade, timestamp };
+  }
+
+  if (table === "portfolio_snapshots") {
+    return {
+      event: "portfolio.snapshot",
+      data: newRow as unknown as PortfolioSnapshot,
+      timestamp,
+    };
+  }
+
+  if (table === "ai_decisions") {
+    return {
+      event: "ai.decision",
+      data: newRow as unknown as AIDecision,
+      timestamp,
+    };
+  }
+
+  return null;
+}
+
+/** Which Supabase tables to subscribe to based on requested topics. */
+function topicsToTables(topics: string[]): string[] {
+  if (topics.length === 0) {
+    // Default: subscribe to core tables
+    return ["trades", "portfolio_snapshots", "ai_decisions"];
+  }
+
+  const tables: string[] = [];
+  for (const t of topics) {
+    switch (t) {
+      case "trades":
+        tables.push("trades");
+        break;
+      case "portfolio":
+        tables.push("portfolio_snapshots");
+        break;
+      case "ai":
+      case "decisions":
+        tables.push("ai_decisions");
+        break;
+      case "pace":
+      case "cost":
+        // These are derived; subscribe to underlying tables
+        tables.push("trades", "ai_decisions");
+        break;
+      default:
+        // Treat topic name as a table name directly
+        tables.push(t);
+    }
+  }
+  return [...new Set(tables)];
+}
+
 export function useWebSocket(
   options: UseWebSocketOptions = {}
 ): UseWebSocketReturn {
-  const {
-    topics = [],
-    reconnect = true,
-    reconnectDelay = 3000,
-    eventTypes,
-    onEvent,
-  } = options;
+  const { topics = [], eventTypes, onEvent } = options;
 
   const [connected, setConnected] = useState(false);
   const [lastEvent, setLastEvent] = useState<WSEvent | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
+  const channelsRef = useRef<RealtimeChannel[]>([]);
 
-  const send = useCallback((data: Record<string, unknown>) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-    }
+  // send() is a no-op — Supabase Realtime is server-push only
+  const send = useCallback((_data: Record<string, unknown>) => {
+    // No-op: Supabase Realtime does not support client-to-server messages.
   }, []);
 
   useEffect(() => {
-    function connect() {
-      const apiUrl = import.meta.env.VITE_API_URL ?? "";
-      let wsUrl: string;
-      if (apiUrl) {
-        const parsed = new URL(apiUrl);
-        const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-        wsUrl = `${wsProtocol}//${parsed.host}/ws`;
-      } else {
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        wsUrl = `${protocol}//${window.location.host}/ws`;
-      }
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+    const tables = topicsToTables(topics);
+    const channels: RealtimeChannel[] = [];
 
-      ws.onopen = () => {
-        setConnected(true);
-        // Subscribe to requested topics
-        for (const topic of topics) {
-          ws.send(JSON.stringify({ action: "subscribe", topic }));
-        }
-      };
+    for (const table of tables) {
+      const channel = supabase
+        .channel(`realtime-${table}-${Math.random().toString(36).slice(2)}`)
+        .on(
+          "postgres_changes" as never,
+          { event: "*", schema: "public", table } as never,
+          (payload: { eventType: string; new: Record<string, unknown> }) => {
+            const wsEvent = toWSEvent(table, payload.eventType, payload.new);
+            if (!wsEvent) return;
 
-      ws.onmessage = (e) => {
-        try {
-          const event = JSON.parse(e.data) as WSEvent;
-          // Filter by event type if specified
-          if (eventTypes && !eventTypes.includes(event.event as WSEventType)) {
-            return;
+            // Filter by event type if specified
+            if (
+              eventTypes &&
+              !eventTypes.includes(wsEvent.event as WSEventType)
+            ) {
+              return;
+            }
+
+            setLastEvent(wsEvent);
+            onEventRef.current?.(wsEvent);
           }
-          setLastEvent(event);
-          onEventRef.current?.(event);
-        } catch {
-          // Ignore malformed messages
-        }
-      };
+        )
+        .subscribe((status: string) => {
+          if (status === "SUBSCRIBED") {
+            setConnected(true);
+          }
+        });
 
-      ws.onclose = () => {
-        setConnected(false);
-        wsRef.current = null;
-        if (reconnect) {
-          reconnectTimer.current = setTimeout(connect, reconnectDelay);
-        }
-      };
-
-      ws.onerror = () => {
-        ws.close();
-      };
+      channels.push(channel);
     }
 
-    connect();
+    channelsRef.current = channels;
 
     return () => {
-      clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
-      wsRef.current = null;
+      for (const ch of channels) {
+        supabase.removeChannel(ch);
+      }
+      channelsRef.current = [];
+      setConnected(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reconnect, reconnectDelay, topics.join(","), eventTypes?.join(",")]);
+  }, [topics.join(","), eventTypes?.join(",")]);
 
   return { connected, lastEvent, send };
 }

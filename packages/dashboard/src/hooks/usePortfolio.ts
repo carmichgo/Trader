@@ -1,5 +1,5 @@
 /**
- * Portfolio data hooks using React Query + WebSocket for real-time updates.
+ * Portfolio data hooks using React Query + Supabase Realtime for live updates.
  */
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -34,6 +34,27 @@ export function usePortfolio(hours = 24) {
 }
 
 export function useTraderPortfolio(trader: string, days = 7) {
+  const queryClient = useQueryClient();
+
+  const onEvent = useCallback(
+    (event: WSEvent) => {
+      if (
+        event.event === "trade.opened" ||
+        event.event === "trade.closed" ||
+        event.event === "trade.updated"
+      ) {
+        queryClient.invalidateQueries({ queryKey: ["portfolio", trader] });
+      }
+    },
+    [queryClient, trader]
+  );
+
+  useWebSocket({
+    topics: ["trades"],
+    eventTypes: ["trade.opened", "trade.closed", "trade.updated"],
+    onEvent,
+  });
+
   return useQuery({
     queryKey: ["portfolio", trader, days],
     queryFn: () => getTraderPortfolio(trader, days),
@@ -54,7 +75,11 @@ export function usePace() {
 
   const onEvent = useCallback(
     (event: WSEvent) => {
-      if (event.event === "pace.update") {
+      if (
+        event.event === "trade.opened" ||
+        event.event === "trade.closed" ||
+        event.event === "ai.decision"
+      ) {
         queryClient.invalidateQueries({ queryKey: ["pace"] });
       }
     },
@@ -62,8 +87,8 @@ export function usePace() {
   );
 
   useWebSocket({
-    topics: ["pace"],
-    eventTypes: ["pace.update"],
+    topics: ["trades", "decisions"],
+    eventTypes: ["trade.opened", "trade.closed", "ai.decision"],
     onEvent,
   });
 

@@ -1,5 +1,5 @@
 /**
- * Trade history hooks with real-time updates via WebSocket.
+ * Trade history hooks with real-time updates via Supabase Realtime.
  */
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
