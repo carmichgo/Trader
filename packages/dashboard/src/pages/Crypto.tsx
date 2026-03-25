@@ -1,12 +1,11 @@
+import { useState } from "react";
 import { useTraderPortfolio } from "../hooks/usePortfolio";
-import { useTrades } from "../hooks/useTrades";
+import { useTrades, useTradeDetail } from "../hooks/useTrades";
 import TradeTable from "../components/TradeTable";
-import TraderCard from "../components/TraderCard";
-import PortfolioChart from "../components/PortfolioChart";
-import type { PortfolioSnapshot, Trade } from "../lib/types";
+import type { Trade } from "../lib/types";
 import {
-  BarChart,
-  Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -15,170 +14,241 @@ import {
 } from "recharts";
 
 export default function Crypto() {
-  const { data: traderData, isLoading } = useTraderPortfolio("crypto", 14);
-  const { data: tradesData } = useTrades({ trader: "crypto", limit: 50 });
+  const { data: portfolio } = useTraderPortfolio("crypto", 30);
+  const { data: tradesData } = useTrades({
+    trader: "crypto",
+    since_hours: 168,
+    limit: 200,
+  });
+  const [selectedTrade, setSelectedTrade] = useState<Trade | null>(null);
+  const { data: tradeDetail } = useTradeDetail(selectedTrade?.id ?? null);
 
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-96">
-        <div className="text-terminal-muted animate-pulse">Loading Crypto data...</div>
-      </div>
-    );
-  }
-
-  const summary = traderData?.summary;
-  const dailyPerf = traderData?.daily_performance ?? [];
-  const openTrades = traderData?.open_trades ?? [];
-  const allTrades = tradesData?.trades ?? [];
-
-  const history: PortfolioSnapshot[] = dailyPerf.map((d) => ({
-    time: d.date,
-    total_capital: d.net_pnl,
-    polymarket_capital: null,
-    crypto_capital: d.net_pnl,
-    stocks_capital: null,
-  }));
-
-  // Daily P&L bar data
-  const dailyPnlData = dailyPerf.map((d) => ({
-    date: d.date.slice(5),
-    pnl: d.net_pnl,
-    fees: d.total_trading_fees,
-  }));
+  const dailyPerf = portfolio?.daily_performance ?? [];
+  const cumPnl = dailyPerf.reduce<{ date: string; cumulative: number }[]>(
+    (acc, d) => {
+      const prev = acc.length > 0 ? acc[acc.length - 1]!.cumulative : 0;
+      acc.push({ date: d.date.slice(5), cumulative: prev + d.net_pnl });
+      return acc;
+    },
+    []
+  );
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-bold">Crypto</h2>
-          <p className="text-sm text-terminal-muted">Crypto positions, charts, and funding</p>
+          <h1 className="text-xl font-bold">Crypto Trading</h1>
+          <p className="text-terminal-muted text-sm">
+            Cryptocurrency positions, funding rates, and trades
+          </p>
         </div>
-        <span className="badge badge-amber">{openTrades.length} open positions</span>
-      </div>
-
-      {/* Summary + Equity */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div>
-          {summary && (
-            <TraderCard
-              trader="crypto"
-              summary={summary}
-              todayPerformance={dailyPerf[dailyPerf.length - 1]}
-              openTradesCount={openTrades.length}
-            />
-          )}
-          {/* Funding & Fees */}
-          <div className="card mt-4">
-            <div className="card-header">Costs Summary</div>
-            <div className="space-y-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-terminal-muted">Total Trading Fees</span>
-                <span className="tabular-nums text-terminal-amber">
-                  ${dailyPerf.reduce((s, d) => s + d.total_trading_fees, 0).toFixed(4)}
-                </span>
+        {portfolio && (
+          <div className="flex items-center gap-6">
+            <div className="text-right">
+              <div className="stat-label">Total P&L</div>
+              <div
+                className={`text-lg font-bold tabular-nums ${
+                  portfolio.summary.total_pnl >= 0
+                    ? "text-terminal-green"
+                    : "text-terminal-red"
+                }`}
+              >
+                {portfolio.summary.total_pnl >= 0 ? "+" : ""}$
+                {portfolio.summary.total_pnl.toFixed(2)}
               </div>
-              <div className="flex justify-between">
-                <span className="text-terminal-muted">Total Inference Cost</span>
-                <span className="tabular-nums text-terminal-amber">
-                  ${dailyPerf.reduce((s, d) => s + d.total_inference_cost, 0).toFixed(4)}
-                </span>
-              </div>
-              <div className="flex justify-between border-t border-terminal-border pt-2">
-                <span className="text-terminal-muted">Sharpe Ratio (latest)</span>
-                <span className="tabular-nums">
-                  {dailyPerf[dailyPerf.length - 1]?.sharpe_ratio?.toFixed(2) ?? "N/A"}
-                </span>
+            </div>
+            <div className="text-right">
+              <div className="stat-label">Win Rate</div>
+              <div className="text-lg font-bold tabular-nums">
+                {portfolio.summary.win_rate_pct.toFixed(1)}%
               </div>
             </div>
           </div>
-        </div>
-        <div className="lg:col-span-2">
-          <PortfolioChart history={history} height={300} />
-        </div>
+        )}
       </div>
 
-      {/* Daily P&L Chart */}
-      <div className="card">
-        <div className="card-header">Daily P&L</div>
-        <ResponsiveContainer width="100%" height={220}>
-          <BarChart data={dailyPnlData}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-            <XAxis dataKey="date" stroke="#6b7280" fontSize={10} tickLine={false} />
-            <YAxis
-              stroke="#6b7280"
-              fontSize={10}
-              tickLine={false}
-              tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-            />
-            <Tooltip
-              contentStyle={{
-                backgroundColor: "#111827",
-                border: "1px solid #1f2937",
-                borderRadius: "8px",
-                fontSize: "12px",
-              }}
-              formatter={(value: number, name: string) => [
-                `$${value.toFixed(4)}`,
-                name === "pnl" ? "Net P&L" : "Fees",
-              ]}
-            />
-            <Bar
-              dataKey="pnl"
-              name="Net P&L"
-              radius={[2, 2, 0, 0]}
-              fill="#ffab00"
-            />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Open Positions */}
-      {openTrades.length > 0 && (
+      {/* Stats row */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="card">
-          <div className="card-header">Open Positions</div>
-          <div className="space-y-3">
-            {openTrades.map((trade: Trade) => (
-              <div
-                key={trade.id}
-                className="flex items-center justify-between py-2 px-3 rounded-md bg-terminal-bg border border-terminal-border"
-              >
-                <div className="flex items-center gap-3">
-                  <span
-                    className={`text-xs font-semibold ${
-                      trade.direction === "buy"
-                        ? "text-terminal-green"
-                        : "text-terminal-red"
-                    }`}
+          <div className="stat-label">Open Positions</div>
+          <div className="stat-value">{portfolio?.open_trades.length ?? 0}</div>
+        </div>
+        <div className="card">
+          <div className="stat-label">Total Trades</div>
+          <div className="stat-value">{portfolio?.summary.total_trades ?? 0}</div>
+        </div>
+        <div className="card">
+          <div className="stat-label">Win / Loss</div>
+          <div className="stat-value text-lg">
+            <span className="text-terminal-green">{portfolio?.summary.total_wins ?? 0}</span>
+            <span className="text-terminal-muted mx-1">/</span>
+            <span className="text-terminal-red">{portfolio?.summary.total_losses ?? 0}</span>
+          </div>
+        </div>
+        <div className="card">
+          <div className="stat-label">Today Inference Cost</div>
+          <div className="stat-value text-lg text-terminal-amber">
+            ${dailyPerf.length > 0
+              ? dailyPerf[dailyPerf.length - 1]!.total_inference_cost.toFixed(4)
+              : "0.00"}
+          </div>
+        </div>
+      </div>
+
+      {/* Open positions */}
+      {portfolio && portfolio.open_trades.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            Open Positions ({portfolio.open_trades.length})
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-terminal-muted text-xs uppercase tracking-wider border-b border-terminal-border">
+                  <th className="text-left py-2 px-2">Asset</th>
+                  <th className="text-left py-2 px-2">Direction</th>
+                  <th className="text-right py-2 px-2">Size</th>
+                  <th className="text-right py-2 px-2">Entry</th>
+                  <th className="text-right py-2 px-2">Stop Loss</th>
+                  <th className="text-right py-2 px-2">Take Profit</th>
+                  <th className="text-right py-2 px-2">Opened</th>
+                </tr>
+              </thead>
+              <tbody>
+                {portfolio.open_trades.map((t) => (
+                  <tr
+                    key={t.id}
+                    className="table-row cursor-pointer"
+                    onClick={() => setSelectedTrade(t)}
                   >
-                    {trade.direction.toUpperCase()}
-                  </span>
-                  <span className="font-medium text-sm">{trade.asset}</span>
-                </div>
-                <div className="flex items-center gap-4 text-sm tabular-nums">
-                  <span className="text-terminal-muted">
-                    ${trade.position_size_usd.toFixed(2)}
-                  </span>
-                  <span className="text-terminal-muted">
-                    Entry: {trade.entry_price?.toFixed(2) ?? "-"}
-                  </span>
-                  <span className="text-terminal-muted">
-                    SL: {trade.stop_loss?.toFixed(2) ?? "-"}
-                  </span>
-                  <span className="text-terminal-muted">
-                    TP: {trade.take_profit?.toFixed(2) ?? "-"}
-                  </span>
-                </div>
-              </div>
-            ))}
+                    <td className="py-2 px-2 font-medium">{t.asset}</td>
+                    <td className="py-2 px-2">
+                      <span
+                        className={`text-xs font-semibold ${
+                          t.direction === "long"
+                            ? "text-terminal-green"
+                            : "text-terminal-red"
+                        }`}
+                      >
+                        {t.direction.toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="py-2 px-2 text-right tabular-nums">
+                      ${t.position_size_usd.toFixed(2)}
+                    </td>
+                    <td className="py-2 px-2 text-right tabular-nums text-xs">
+                      {t.entry_price?.toFixed(2) ?? "-"}
+                    </td>
+                    <td className="py-2 px-2 text-right tabular-nums text-xs text-terminal-red">
+                      {t.stop_loss?.toFixed(2) ?? "-"}
+                    </td>
+                    <td className="py-2 px-2 text-right tabular-nums text-xs text-terminal-green">
+                      {t.take_profit?.toFixed(2) ?? "-"}
+                    </td>
+                    <td className="py-2 px-2 text-right text-xs text-terminal-muted">
+                      {t.opened_at
+                        ? new Date(t.opened_at).toLocaleDateString()
+                        : "-"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
 
-      {/* Trade History */}
+      {/* Cumulative P&L chart */}
+      {cumPnl.length > 0 && (
+        <div className="card">
+          <div className="card-header">Cumulative P&L</div>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={cumPnl}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+              <XAxis dataKey="date" stroke="#6b7280" fontSize={10} tickLine={false} />
+              <YAxis stroke="#6b7280" fontSize={10} tickLine={false} tickFormatter={(v: number) => `$${v.toFixed(0)}`} />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: "#111827",
+                  border: "1px solid #1f2937",
+                  borderRadius: "8px",
+                  fontSize: "12px",
+                }}
+                formatter={(value: number) => [`$${value.toFixed(2)}`, "Cumulative P&L"]}
+              />
+              <Line
+                type="monotone"
+                dataKey="cumulative"
+                stroke="#ffab00"
+                strokeWidth={2}
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* Trade detail */}
+      {selectedTrade && tradeDetail && (
+        <div className="card border-terminal-amber/30">
+          <div className="flex items-center justify-between mb-3">
+            <div className="card-header mb-0">Trade Detail: {tradeDetail.asset}</div>
+            <button
+              onClick={() => setSelectedTrade(null)}
+              className="text-terminal-muted hover:text-gray-300 text-xs"
+            >
+              Close
+            </button>
+          </div>
+          <div className="grid grid-cols-4 gap-4 text-sm">
+            <div>
+              <span className="text-terminal-muted text-xs">Direction:</span>
+              <div className="font-medium capitalize">{tradeDetail.direction}</div>
+            </div>
+            <div>
+              <span className="text-terminal-muted text-xs">P&L:</span>
+              <div
+                className={`font-bold tabular-nums ${
+                  (tradeDetail.net_pnl ?? 0) >= 0
+                    ? "text-terminal-green"
+                    : "text-terminal-red"
+                }`}
+              >
+                ${tradeDetail.net_pnl?.toFixed(2) ?? "-"}
+              </div>
+            </div>
+            <div>
+              <span className="text-terminal-muted text-xs">Confidence:</span>
+              <div className="font-medium tabular-nums">
+                {tradeDetail.ai_confidence
+                  ? `${(tradeDetail.ai_confidence * 100).toFixed(0)}%`
+                  : "-"}
+              </div>
+            </div>
+            <div>
+              <span className="text-terminal-muted text-xs">Model:</span>
+              <div className="font-medium text-xs">{tradeDetail.ai_model_used ?? "-"}</div>
+            </div>
+          </div>
+          {tradeDetail.analyst_output && (
+            <div className="mt-3">
+              <div className="text-xs text-terminal-muted mb-1">Analyst Output:</div>
+              <pre className="bg-terminal-bg border border-terminal-border rounded p-2 text-xs text-gray-300 overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">
+                {tradeDetail.analyst_output}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Trade history */}
       <div className="card">
         <div className="card-header">Trade History</div>
-        <TradeTable trades={allTrades} showTrader={false} />
+        <TradeTable
+          trades={tradesData?.trades ?? []}
+          showTrader={false}
+          onSelectTrade={setSelectedTrade}
+        />
       </div>
     </div>
   );
