@@ -104,7 +104,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   };
 
   try {
-    // Verify cron auth (optional — Vercel cron uses its own auth on Pro plan)
+    // Verify cron auth (optional)
     const cronSecret = process.env.CRON_SECRET;
     if (cronSecret) {
       const authHeader = req.headers['authorization'];
@@ -114,7 +114,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 1. Fetch market data
-    const markets = await fetchCryptoData();
+    let markets: MarketData[];
+    try {
+      markets = await fetchCryptoData();
+    } catch (err) {
+      result.errors.push(`CoinGecko fetch failed: ${String(err)}`);
+      return res.status(200).json(result);
+    }
     const snapshot = buildMarketSnapshot(markets);
 
     // 2. Screen with Sonnet
@@ -170,7 +176,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
 
       let analystResponse;
       try {
-        analystResponse = await callClaude(OPUS, ANALYST_SYSTEM_PROMPT, analystPrompt, 2048);
+        analystResponse = await callClaude(SONNET, ANALYST_SYSTEM_PROMPT, analystPrompt, 2048);
       } catch (err) {
         result.errors.push(`Analyst call failed for ${opp.asset}: ${String(err)}`);
         continue;
@@ -220,7 +226,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
         take_profit: analyst.take_profit,
         status: 'open',
         ai_confidence: analyst.confidence,
-        ai_model_used: OPUS,
+        ai_model_used: 'sonnet+sonnet',
         screener_cost: screenerResponse.cost_usd,
         analyst_cost: analystResponse.cost_usd,
         total_cost: totalInferenceCost,
