@@ -42,3 +42,4 @@ htmlcov/
 # TypeScript
 *.tsbuildinfo
 .vercel
+.env.vercel
