@@ -1,9 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "cd packages/dashboard && npm install && npm run build",
-  "installCommand": "echo 'skipping root install'",
-  "outputDirectory": "packages/dashboard/dist",
+  "installCommand": "npm install",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
   "framework": "vite",
+  "rootDirectory": "packages/dashboard",
   "rewrites": [
     { "source": "/(.*)", "destination": "/index.html" }
   ],
