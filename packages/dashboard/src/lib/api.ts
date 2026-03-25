@@ -18,7 +18,8 @@ import type {
   Trade,
 } from "./types";
 
-const BASE = "/api";
+const API_URL = import.meta.env.VITE_API_URL ?? "";
+const BASE = `${API_URL}/api`;
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -142,5 +143,23 @@ export function getPace(): Promise<PaceStatus> {
 // ── Health ─────────────────────────────────────────────────────────────────
 
 export function getHealth(): Promise<{ status: string }> {
-  return fetchJSON("/healthz");
+  return fetchJSON(`${API_URL}/healthz`);
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────
+
+export function pauseTrader(trader: string): Promise<{ status: string }> {
+  return fetchJSON(`${BASE}/controls/pause/${trader}`, { method: "POST" });
+}
+
+export function resumeTrader(trader: string): Promise<{ status: string }> {
+  return fetchJSON(`${BASE}/controls/resume/${trader}`, { method: "POST" });
+}
+
+export function pauseAll(): Promise<{ status: string }> {
+  return fetchJSON(`${BASE}/controls/pause-all`, { method: "POST" });
+}
+
+export function killSwitch(): Promise<{ status: string }> {
+  return fetchJSON(`${BASE}/controls/kill`, { method: "POST" });
 }
