@@ -43,10 +43,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const errors: string[] = [];
 
   try {
-    // Verify cron auth
-    const authHeader = req.headers['authorization'];
-    if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-      return res.status(401).json({ error: 'Unauthorized' });
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret) {
+      const authHeader = req.headers['authorization'];
+      if (authHeader !== `Bearer ${cronSecret}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
     }
 
     // 1. Fetch current goal
