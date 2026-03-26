@@ -56,8 +56,8 @@ interface MarketData {
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 
 const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  'claude-sonnet-4-6-20250514': { input: 3, output: 15 },
-  'claude-opus-4-6-20250514': { input: 15, output: 75 },
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-opus-4-6': { input: 15, output: 75 },
 };
 
 async function callClaude(
@@ -129,8 +129,8 @@ function extractJSON<T = unknown>(raw: string): T {
 
 // ── Stock trader logic ──
 
-const SONNET = 'claude-sonnet-4-6-20250514';
-const OPUS = 'claude-opus-4-6-20250514';
+const SONNET = 'claude-sonnet-4-6';
+const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'stocks';
 
 // Top liquid tickers to monitor
@@ -456,7 +456,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
 
       let analystResponse;
       try {
-        analystResponse = await callClaude(SONNET, ANALYST_SYSTEM_PROMPT, analystPrompt, 2048);
+        analystResponse = await callClaude(SONNET, ANALYST_SYSTEM_PROMPT, analystPrompt, 1024);
       } catch (err) {
         result.errors.push(`Analyst call failed for ${opp.asset}: ${String(err)}`);
         continue;
