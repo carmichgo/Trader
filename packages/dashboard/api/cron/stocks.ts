@@ -56,8 +56,8 @@ interface MarketData {
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 
 const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  'claude-sonnet-4-20250514': { input: 3, output: 15 },
-  'claude-opus-4-20250514': { input: 15, output: 75 },
+  'claude-sonnet-4-6-20250514': { input: 3, output: 15 },
+  'claude-opus-4-6-20250514': { input: 15, output: 75 },
 };
 
 async function callClaude(
@@ -129,8 +129,8 @@ function extractJSON<T = unknown>(raw: string): T {
 
 // ── Stock trader logic ──
 
-const SONNET = 'claude-sonnet-4-20250514';
-const OPUS = 'claude-opus-4-20250514';
+const SONNET = 'claude-sonnet-4-6-20250514';
+const OPUS = 'claude-opus-4-6-20250514';
 const TRADER_NAME = 'stocks';
 
 // Top liquid tickers to monitor
