@@ -106,6 +106,19 @@ interface StrategistPlan {
   risk_posture: 'aggressive' | 'moderate' | 'conservative' | 'defensive';
   daily_pnl_target_usd: number;
 
+  safety_rails: {
+    max_daily_drawdown_pct: number;       // Pause all trading if daily losses exceed this %
+    max_single_trade_pct: number;         // Max % of total capital in any single trade
+    max_concurrent_positions: number;     // Max open positions across all traders
+    max_daily_inference_cost_usd: number; // Max AI spend per day
+    max_leverage: number;                 // Max leverage for crypto
+    mandatory_stop_loss: boolean;         // Every trade must have a stop-loss
+    max_stop_loss_pct: number;            // Widest allowed stop-loss
+    kill_switch_drawdown_pct: number;     // Emergency stop if total drawdown exceeds this
+    max_losing_streak_before_pause: number; // Pause trader after N consecutive losses
+    cool_down_hours_after_pause: number;  // Hours to wait before resuming after pause
+  };
+
   trader_directives: {
     crypto: {
       enabled: boolean;
@@ -135,6 +148,38 @@ interface StrategistPlan {
   goal_feasibility: 'on_track' | 'at_risk' | 'unreachable';
 }
 
+// HARD LIMITS — the AI can NEVER exceed these, no matter what
+const HARD_LIMITS = {
+  max_single_trade_pct: 25,          // Never >25% on one trade
+  max_single_market_allocation: 60,  // Never >60% in one market
+  kill_switch_drawdown_pct: 50,      // Emergency stop at 50% total drawdown
+  max_daily_drawdown_pct: 15,        // Never allow >15% daily drawdown
+  max_leverage: 5,                   // Never >5x leverage
+  max_stop_loss_pct: 20,             // Stop-loss can't be wider than 20%
+  max_concurrent_positions: 50,      // Never >50 simultaneous positions
+  max_daily_inference_cost_usd: 25,  // Never spend >$25/day on AI
+};
+
+function enforceHardLimits(plan: StrategistPlan): StrategistPlan {
+  const sr = plan.safety_rails;
+  sr.max_single_trade_pct = Math.min(sr.max_single_trade_pct, HARD_LIMITS.max_single_trade_pct);
+  sr.kill_switch_drawdown_pct = Math.min(sr.kill_switch_drawdown_pct, HARD_LIMITS.kill_switch_drawdown_pct);
+  sr.max_daily_drawdown_pct = Math.min(sr.max_daily_drawdown_pct, HARD_LIMITS.max_daily_drawdown_pct);
+  sr.max_leverage = Math.min(sr.max_leverage, HARD_LIMITS.max_leverage);
+  sr.max_stop_loss_pct = Math.min(sr.max_stop_loss_pct, HARD_LIMITS.max_stop_loss_pct);
+  sr.max_concurrent_positions = Math.min(sr.max_concurrent_positions, HARD_LIMITS.max_concurrent_positions);
+  sr.max_daily_inference_cost_usd = Math.min(sr.max_daily_inference_cost_usd, HARD_LIMITS.max_daily_inference_cost_usd);
+
+  // Enforce max market allocation
+  for (const market of ['crypto', 'stocks', 'polymarket'] as const) {
+    if (plan.allocations[market] > HARD_LIMITS.max_single_market_allocation) {
+      plan.allocations[market] = HARD_LIMITS.max_single_market_allocation;
+    }
+  }
+
+  return plan;
+}
+
 const STRATEGIST_SYSTEM_PROMPT = `You are the chief strategist AI for a goal-driven autonomous paper-trading system.
 
 Your role is the META-BRAIN: you set the daily plan that ALL downstream traders must follow exactly. You do NOT trade yourself — you direct three trader agents (crypto, stocks, polymarket) by issuing specific directives.
@@ -152,6 +197,10 @@ KEY PRINCIPLES:
    - Polymarket: CRITICAL — only trade events that will RESOLVE within the goal's remaining time horizon. If you have 30 days left, do NOT bet on events resolving in 6 months.
 5. For Polymarket specifically: set max_event_horizon_days to roughly match the goal's remaining days. This prevents capital from being locked in long-dated bets that cannot contribute to the goal.
 
+6. SAFETY RAILS: You must set risk limits appropriate to the goal. Conservative goals get tight rails, aggressive goals get looser rails (but never exceeding hard limits).
+   - Hard limits you CANNOT exceed: max 25% per trade, max 60% per market, max 50% total drawdown, max 15% daily drawdown, max 5x leverage, max $25/day AI cost
+   - Within those hard limits, YOU decide the appropriate soft limits based on the goal
+
 Respond ONLY with a JSON object matching this exact structure:
 {
   "allocations": {
@@ -162,6 +211,18 @@ Respond ONLY with a JSON object matching this exact structure:
   },
   "risk_posture": "aggressive" | "moderate" | "conservative" | "defensive",
   "daily_pnl_target_usd": <number>,
+  "safety_rails": {
+    "max_daily_drawdown_pct": <number, pause trading if daily loss exceeds this %. Derive from goal: conservative=2-3%, moderate=5%, aggressive=8-10%>,
+    "max_single_trade_pct": <number, max % of total capital per trade. Conservative=3-5%, moderate=8-10%, aggressive=15-20%>,
+    "max_concurrent_positions": <number, how many open positions allowed. Conservative=5-8, moderate=10-15, aggressive=20-30>,
+    "max_daily_inference_cost_usd": <number, AI budget per day. Scale with capital and expected profit>,
+    "max_leverage": <number, 1=no leverage, up to 3 for aggressive crypto>,
+    "mandatory_stop_loss": true,
+    "max_stop_loss_pct": <number, widest stop-loss allowed. Conservative=3-5%, moderate=8%, aggressive=12%>,
+    "kill_switch_drawdown_pct": <number, emergency stop if total portfolio drops this much from peak. Conservative=10-15%, moderate=25%, aggressive=35-40%>,
+    "max_losing_streak_before_pause": <number, pause after N consecutive losses. Conservative=3, moderate=5, aggressive=8>,
+    "cool_down_hours_after_pause": <number, hours to wait. Conservative=8, moderate=4, aggressive=2>
+  },
   "trader_directives": {
     "crypto": {
       "enabled": <boolean>,
@@ -186,11 +247,11 @@ Respond ONLY with a JSON object matching this exact structure:
       "strategy_notes": "<specific guidance for the polymarket trader>"
     }
   },
-  "reasoning": "<explain your overall strategy and how it connects to the goal>",
+  "reasoning": "<explain your overall strategy, safety rails rationale, and how it connects to the goal>",
   "goal_feasibility": "on_track" | "at_risk" | "unreachable"
 }
 
-The allocations must sum to 100. Be specific and actionable in your directives — the traders will follow them literally.`;
+The allocations must sum to 100. Be specific and actionable. The safety_rails you set will be ENFORCED by the system — choose them wisely based on the goal.`;
 
 export async function runStrategist(): Promise<{
   trader: string;
@@ -344,6 +405,9 @@ Based on the goal and current state, create the trading plan with per-trader dir
     };
   }
 
+  // Enforce hard limits the AI cannot override
+  plan = enforceHardLimits(plan);
+
   // Validate allocations sum to 100
   const totalAlloc =
     plan.allocations.crypto +
@@ -365,7 +429,7 @@ Based on the goal and current state, create the trading plan with per-trader dir
     goal_id: goalId,
     plan_date: new Date().toISOString().split('T')[0],
     allocations: plan.allocations,
-    trader_configs: plan.trader_directives,
+    trader_configs: { ...plan.trader_directives, safety_rails: plan.safety_rails },
     daily_target: plan.daily_pnl_target_usd,
     reasoning: `[${plan.risk_posture}] [${plan.goal_feasibility}] ${plan.reasoning}`,
     goal_feasibility: plan.goal_feasibility,

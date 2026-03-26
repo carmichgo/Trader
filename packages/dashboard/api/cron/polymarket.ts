@@ -298,7 +298,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .order('created_at', { ascending: false })
       .limit(1);
     const plan = plans?.[0] as Record<string, unknown> | undefined;
-    const directives = (plan?.trader_configs as Record<string, unknown>)?.polymarket as {
+    const traderConfigs = plan?.trader_configs as Record<string, unknown> | undefined;
+    const directives = traderConfigs?.polymarket as {
       enabled?: boolean;
       max_position_pct?: number;
       confidence_threshold?: number;
@@ -306,6 +307,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       focus_categories?: string[];
       strategy_notes?: string;
     } | undefined;
+    const safetyRails = traderConfigs?.safety_rails as {
+      max_daily_drawdown_pct?: number;
+      max_single_trade_pct?: number;
+      max_concurrent_positions?: number;
+      max_daily_inference_cost_usd?: number;
+      mandatory_stop_loss?: boolean;
+      max_stop_loss_pct?: number;
+    } | undefined;
+
+    // Enforce max concurrent positions from safety rails
+    if (safetyRails?.max_concurrent_positions) {
+      const { count: openCount } = await supabase
+        .from('trades')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'open');
+      if ((openCount ?? 0) >= safetyRails.max_concurrent_positions) {
+        return res.status(200).json({
+          ...result,
+          errors: ['Max concurrent positions reached. Skipping.'],
+        });
+      }
+    }
 
     // Skip if strategist disabled this trader
     if (directives && directives.enabled === false) {

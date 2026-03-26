@@ -290,12 +290,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .order('created_at', { ascending: false })
       .limit(1);
     const plan = plans?.[0] as Record<string, unknown> | undefined;
-    const directives = (plan?.trader_configs as Record<string, unknown>)?.crypto as {
+    const traderConfigs = plan?.trader_configs as Record<string, unknown> | undefined;
+    const directives = traderConfigs?.crypto as {
       enabled?: boolean;
       max_position_pct?: number;
       confidence_threshold?: number;
       focus_assets?: string[];
       strategy_notes?: string;
+    } | undefined;
+    const safetyRails = traderConfigs?.safety_rails as {
+      max_daily_drawdown_pct?: number;
+      max_single_trade_pct?: number;
+      max_concurrent_positions?: number;
+      max_daily_inference_cost_usd?: number;
+      mandatory_stop_loss?: boolean;
+      max_stop_loss_pct?: number;
+      max_losing_streak_before_pause?: number;
     } | undefined;
 
     // Skip if strategist disabled this trader
@@ -303,6 +313,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ...result,
         errors: ['Crypto trader disabled by strategist'],
+      });
+    }
+
+    // Enforce max concurrent positions from safety rails
+    if (safetyRails?.max_concurrent_positions) {
+      const { count: openCount } = await supabase
+        .from('trades')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'open');
+      if ((openCount ?? 0) >= safetyRails.max_concurrent_positions) {
+        return res.status(200).json({
+          ...result,
+          errors: [`Max concurrent positions (${safetyRails.max_concurrent_positions}) reached. Skipping.`],
+        });
+      }
+    }
+
+    // Enforce inference cost cap from safety rails
+    const inferenceCap = safetyRails?.max_daily_inference_cost_usd ?? DAILY_COST_CAP_USD;
+    if (dailyCost >= inferenceCap) {
+      return res.status(200).json({
+        ...result,
+        errors: [`Strategist inference cap ($${inferenceCap}) reached. Spent: $${dailyCost.toFixed(4)}`],
       });
     }
 
