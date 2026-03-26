@@ -232,24 +232,24 @@ Respond ONLY with a JSON object matching this exact structure:
     "crypto": {
       "enabled": <boolean>,
       "max_position_pct": <number, max % of crypto allocation in any single trade>,
-      "confidence_threshold": <number 0-100, minimum screener score to trade>,
+      "confidence_threshold": <number 0-100, minimum screener score to send to analyst. IMPORTANT: this must be LOW ENOUGH for trades to happen. Aggressive=45-55, moderate=55-65, conservative=65-75. Do NOT set above 75 or the system will never trade.>,
       "focus_assets": [<string ticker symbols to prioritize>],
-      "strategy_notes": "<specific guidance for the crypto trader>"
+      "strategy_notes": "<specific actionable guidance for the crypto screener AI — it reads this literally>"
     },
     "stocks": {
       "enabled": <boolean>,
       "max_position_pct": <number>,
-      "confidence_threshold": <number 0-100>,
+      "confidence_threshold": <number 0-100, same guidance as crypto: aggressive=45-55, moderate=55-65, conservative=65-75>,
       "focus_assets": [<string ticker symbols>],
-      "strategy_notes": "<specific guidance for the stocks trader>"
+      "strategy_notes": "<specific actionable guidance for the stocks screener AI>"
     },
     "polymarket": {
       "enabled": <boolean>,
       "max_position_pct": <number>,
-      "confidence_threshold": <number 0-100>,
+      "confidence_threshold": <number 0-100, same guidance: aggressive=45-55, moderate=55-65, conservative=65-75>,
       "max_event_horizon_days": <number, only trade events resolving within this many days>,
       "focus_categories": [<string categories like "politics", "crypto", "sports">],
-      "strategy_notes": "<specific guidance for the polymarket trader>"
+      "strategy_notes": "<specific actionable guidance for the polymarket screener AI>"
     }
   },
   "reasoning": "<explain your overall strategy, safety rails rationale, and how it connects to the goal>",
