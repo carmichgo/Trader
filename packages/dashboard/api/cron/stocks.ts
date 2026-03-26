@@ -516,7 +516,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq('status', 'open')
       .eq('trader', 'stocks');
     const openPositions = openTrades ?? [];
-    const openAssets = new Set(openPositions.map((t: Record<string, unknown>) => `${t.asset}:${t.direction}`));
 
     // 1. Fetch market data and macro data in parallel
     const [markets, macroData] = await Promise.all([
@@ -595,11 +594,7 @@ Analyze this stock market data and identify trading opportunities:\n\n${snapshot
       }
       if (opp.score < analystThreshold) continue;
 
-      // DUPLICATE CHECK
-      if (openAssets.has(`${opp.asset}:${opp.direction}`)) {
-        result.errors.push(`Already have open ${opp.direction} in ${opp.asset}, skipping`);
-        continue;
-      }
+
 
       const marketItem = markets.find((m) => m.symbol === opp.asset);
       const analystPrompt = `Trading opportunity identified by screener:

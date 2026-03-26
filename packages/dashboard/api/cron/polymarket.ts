@@ -377,7 +377,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq('status', 'open')
       .eq('trader', 'polymarket');
     const openPositions = openTrades ?? [];
-    const openAssets = new Set(openPositions.map((t: Record<string, unknown>) => `${t.asset}:${t.direction}`));
 
     // 1. Fetch Polymarket data and news in parallel
     const [markets, newsArticles] = await Promise.all([
@@ -472,11 +471,7 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
       }
       if (opp.score < analystThreshold) continue;
 
-      // DUPLICATE CHECK
-      if (openAssets.has(`${opp.asset}:${opp.direction}`)) {
-        result.errors.push(`Already have open ${opp.direction} in ${opp.asset}, skipping`);
-        continue;
-      }
+
 
       const market = markets.find(
         (m) => m.slug === opp.asset || m.question.toLowerCase().includes(opp.asset.toLowerCase())

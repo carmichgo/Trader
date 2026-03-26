@@ -639,7 +639,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq('status', 'open')
       .eq('trader', TRADER_NAME);
     const openPositions = openTrades ?? [];
-    const openAssets = new Set(openPositions.map(t => `${t.asset}:${t.direction}`));
 
     // 1. Fetch market data
     let markets: MarketData[];
@@ -710,11 +709,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       if (opp.score < analystThreshold) continue;
 
-      // DUPLICATE CHECK: skip if we already have an open position in this asset+direction
-      if (openAssets.has(`${opp.asset}:${opp.direction}`)) {
-        result.errors.push(`Already have open ${opp.direction} position in ${opp.asset}, skipping`);
-        continue;
-      }
+
 
       const marketItem = markets.find((m) => m.symbol === opp.asset);
       const analystPrompt = `Trading opportunity:
