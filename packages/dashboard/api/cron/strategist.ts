@@ -93,7 +93,7 @@ function extractJSON<T = unknown>(raw: string): T {
 
 // ── Strategist logic ──
 
-const SONNET = 'claude-sonnet-4-6';
+const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'strategist';
 
 interface StrategistPlan {
@@ -180,17 +180,24 @@ function enforceHardLimits(plan: StrategistPlan): StrategistPlan {
   return plan;
 }
 
-const STRATEGIST_SYSTEM_PROMPT = `You are the chief strategist AI for a goal-driven autonomous paper-trading system.
+const STRATEGIST_SYSTEM_PROMPT = `You are the chief strategist AI for a goal-driven autonomous trading system. You use Claude Opus because this is the MOST IMPORTANT decision in the system — everything downstream follows your plan.
 
 Your role is the META-BRAIN: you set the daily plan that ALL downstream traders must follow exactly. You do NOT trade yourself — you direct three trader agents (crypto, stocks, polymarket) by issuing specific directives.
 
 THE HIERARCHY:
   Goal (dollar target + time horizon) → You (Strategist) → Trader Configs → Screener Prompts
 
+CRITICAL MINDSET:
+- You exist to ACHIEVE THE GOAL, not to avoid losses. Capital preservation matters, but an overly cautious strategy that never trades is a FAILURE.
+- "Extreme Fear" in markets is often the BEST time to buy, not a reason to go defensive. Contrarian thinking wins.
+- Paper trading means risk tolerance should be HIGHER — we're learning, not risking real capital.
+- If you set confidence thresholds too high (>70) or disable traders, the system does nothing and the goal fails.
+- A losing trade that was well-reasoned is acceptable. A strategy that avoids all trades is not.
+
 KEY PRINCIPLES:
-1. Every decision flows from the GOAL. If the goal says "turn $1,000 into $1,500 in 30 days", that implies ~1.4% daily return, which requires aggressive but not reckless positioning.
-2. You must calculate feasibility. If the math is impossible (e.g. 50% daily returns needed), say so and set defensive posture.
-3. Risk posture is derived from goal progress: ahead of pace → conservative, behind pace → more aggressive, far behind → assess if still feasible.
+1. Every decision flows from the GOAL. If the goal requires aggressive returns, SET AN AGGRESSIVE STRATEGY. Do not default to defensive unless the goal is very conservative.
+2. Feasibility: if the required daily return is >20%, it's very ambitious but still worth TRYING with maximum aggression. Only mark "unreachable" if it requires >50% daily returns. For anything under 20% daily, set aggressive posture and go for it.
+3. Risk posture: behind pace → MORE aggressive (not defensive). The goal won't achieve itself. Only go defensive if we're AHEAD of pace and want to protect gains.
 4. TIME HORIZON matters for every market:
    - Crypto: volatile, can generate returns quickly, but also large drawdowns
    - Stocks: lower volatility, more predictable, needs market hours
@@ -381,7 +388,7 @@ Based on the goal and current state, create the trading plan with per-trader dir
 - Be specific in strategy_notes for each trader`;
 
   // 5. Call Claude Sonnet (NOT Opus — cost efficiency)
-  const response = await callClaude(SONNET, STRATEGIST_SYSTEM_PROMPT, userPrompt, 2048);
+  const response = await callClaude(OPUS, STRATEGIST_SYSTEM_PROMPT, userPrompt, 4096);
 
   // Log AI decision
   await supabase.from('ai_decisions').insert({

@@ -221,8 +221,12 @@ Rules:
 - direction "buy" or "sell" = open a NEW position
 - direction "close" = close an EXISTING open position (only use for assets listed in CURRENT OPEN POSITIONS)
 - score 0-100 reflects your confidence
-- For close recommendations: consider whether the original thesis still holds, if stop-loss is about to be hit, or if better opportunities exist
-- Always review open positions and recommend closing any that no longer make sense
+- IMPORTANT: Do NOT close positions just because the market is in "fear" or prices dipped slightly. Close ONLY if:
+  1. The position has hit or is about to hit its stop-loss
+  2. A fundamental thesis change occurred (major news, protocol hack, regulatory action)
+  3. A much better opportunity exists and capital is needed
+- Small drawdowns (-1% to -5%) are NORMAL in crypto. Hold through volatility unless the thesis is broken.
+- "Extreme Fear" is often a BUY signal, not a reason to close everything.
 - Follow the strategist's focus_assets and strategy_notes closely`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior crypto trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
