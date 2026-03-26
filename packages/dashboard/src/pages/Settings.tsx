@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getGoal, updateGoal } from "../lib/api";
+import { getGoal, updateGoal, resetSystem } from "../lib/api";
 import type { Goal, GoalProgress } from "../lib/types";
 
 export default function Settings() {
@@ -39,6 +39,9 @@ export default function Settings() {
 
           {/* System Info */}
           <SystemInfoPanel />
+
+          {/* Reset System */}
+          <ResetPanel />
         </div>
       )}
     </div>
@@ -243,6 +246,140 @@ function APIKeysPanel() {
         API keys are stored securely in environment variables and cannot be viewed or
         modified from the dashboard.
       </p>
+    </div>
+  );
+}
+
+// ── Reset System ──────────────────────────────────────────────────────
+
+function ResetPanel() {
+  const queryClient = useQueryClient();
+  const [confirmStep, setConfirmStep] = useState(0);
+  const [countdown, setCountdown] = useState(0);
+
+  const mutation = useMutation({
+    mutationFn: resetSystem,
+    onSuccess: () => {
+      queryClient.invalidateQueries();
+      setConfirmStep(0);
+      setCountdown(0);
+    },
+  });
+
+  function handleReset() {
+    if (confirmStep === 0) {
+      setConfirmStep(1);
+      return;
+    }
+    if (confirmStep === 1) {
+      setConfirmStep(2);
+      setCountdown(5);
+      const interval = setInterval(() => {
+        setCountdown((c) => {
+          if (c <= 1) {
+            clearInterval(interval);
+            return 0;
+          }
+          return c - 1;
+        });
+      }, 1000);
+      return;
+    }
+    if (confirmStep === 2 && countdown === 0) {
+      mutation.mutate();
+    }
+  }
+
+  function handleCancel() {
+    setConfirmStep(0);
+    setCountdown(0);
+  }
+
+  return (
+    <div className="card border-terminal-red/30">
+      <div className="card-header text-terminal-red">Reset System</div>
+      <p className="text-sm text-terminal-muted mb-4">
+        Delete all trades, AI decisions, portfolio snapshots, strategist plans,
+        performance data, and goals. Start completely fresh.
+      </p>
+
+      {mutation.isSuccess && (
+        <div className="bg-terminal-green/10 border border-terminal-green/30 rounded-md p-3 mb-4">
+          <p className="text-terminal-green text-sm font-medium">
+            System reset complete. All data has been deleted.
+          </p>
+          <p className="text-xs text-terminal-muted mt-1">
+            Set a new goal to begin trading again.
+          </p>
+        </div>
+      )}
+
+      {mutation.isError && (
+        <p className="text-terminal-red text-xs mb-4">
+          Reset failed: {String((mutation.error as Error)?.message ?? mutation.error)}
+        </p>
+      )}
+
+      <div className="space-y-3">
+        {confirmStep === 0 && (
+          <button
+            onClick={handleReset}
+            className="w-full py-2.5 rounded-md bg-terminal-red/10 border border-terminal-red/30 text-terminal-red font-semibold text-sm hover:bg-terminal-red/20 transition-colors"
+          >
+            Reset Everything
+          </button>
+        )}
+
+        {confirmStep === 1 && (
+          <div className="space-y-2">
+            <p className="text-terminal-amber text-sm font-medium">
+              Are you sure? This will permanently delete ALL data.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={handleReset}
+                className="flex-1 py-2 rounded-md bg-terminal-red/20 border border-terminal-red/50 text-terminal-red font-semibold text-sm hover:bg-terminal-red/30 transition-colors"
+              >
+                Yes, I'm sure
+              </button>
+              <button
+                onClick={handleCancel}
+                className="flex-1 py-2 rounded-md bg-terminal-bg border border-terminal-border text-terminal-muted text-sm hover:text-gray-300 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {confirmStep === 2 && (
+          <div className="space-y-2">
+            <p className="text-terminal-red text-sm font-bold">
+              FINAL WARNING: This cannot be undone.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={handleReset}
+                disabled={countdown > 0 || mutation.isPending}
+                className="flex-1 py-2.5 rounded-md bg-red-600 text-white font-bold text-sm hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {mutation.isPending
+                  ? "Deleting..."
+                  : countdown > 0
+                  ? `Wait ${countdown}s...`
+                  : "DELETE EVERYTHING"}
+              </button>
+              <button
+                onClick={handleCancel}
+                disabled={mutation.isPending}
+                className="flex-1 py-2.5 rounded-md bg-terminal-bg border border-terminal-border text-terminal-muted text-sm hover:text-gray-300 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

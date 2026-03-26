@@ -832,3 +832,53 @@ export async function killSwitch(): Promise<{ status: string }> {
   }
   return { status: "killed" };
 }
+
+// ── Reset System ──────────────────────────────────────────────────────────
+
+export async function resetSystem(): Promise<{ status: string; deleted: Record<string, number> }> {
+  const deleted: Record<string, number> = {};
+
+  // Delete in order respecting foreign keys
+  const tables = [
+    "ai_decisions",
+    "trades",
+    "strategist_plans",
+    "daily_performance",
+    "portfolio_snapshots",
+    "market_data",
+    "system_controls",
+    "goals",
+  ];
+
+  for (const table of tables) {
+    const { data, error } = await supabase
+      .from(table)
+      .delete()
+      .gte("id", 0)  // Delete all rows with id
+      .select("id");
+
+    if (error) {
+      // Try without id filter (for tables with composite PKs)
+      const { data: data2 } = await supabase
+        .from(table)
+        .delete()
+        .neq("time", "1900-01-01")  // portfolio_snapshots, market_data
+        .select();
+
+      if (!data2) {
+        const { data: data3 } = await supabase
+          .from(table)
+          .delete()
+          .neq("date", "1900-01-01")  // daily_performance
+          .select();
+        deleted[table] = data3?.length ?? 0;
+      } else {
+        deleted[table] = data2?.length ?? 0;
+      }
+    } else {
+      deleted[table] = data?.length ?? 0;
+    }
+  }
+
+  return { status: "reset_complete", deleted };
+}
