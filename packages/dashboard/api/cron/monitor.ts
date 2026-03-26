@@ -8,6 +8,56 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 const TRADER_NAME = 'monitor';
 
+// ── Alpaca Execution ──
+const ALPACA_BASE = 'https://paper-api.alpaca.markets';
+
+async function alpacaRequest(path: string, method = 'GET', body?: unknown) {
+  const key = process.env.ALPACA_API_KEY;
+  const secret = process.env.ALPACA_API_SECRET;
+  if (!key || !secret) return null;
+
+  const resp = await fetch(`${ALPACA_BASE}${path}`, {
+    method,
+    headers: {
+      'APCA-API-KEY-ID': key,
+      'APCA-API-SECRET-KEY': secret,
+      'Content-Type': 'application/json',
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Alpaca ${method} ${path}: ${resp.status} ${err}`);
+  }
+  return resp.json();
+}
+
+async function closeAlpacaPosition(symbol: string, isCrypto: boolean) {
+  const alpacaSymbol = isCrypto ? (symbol.includes('/') ? symbol : `${symbol}/USD`) : symbol;
+  const encoded = encodeURIComponent(alpacaSymbol);
+  return alpacaRequest(`/v2/positions/${encoded}`, 'DELETE');
+}
+
+interface AlpacaPosition {
+  symbol: string;
+  qty: string;
+  side: string;
+  market_value: string;
+  unrealized_pl: string;
+  current_price: string;
+  avg_entry_price: string;
+}
+
+async function fetchAlpacaPositions(): Promise<AlpacaPosition[]> {
+  try {
+    const positions = await alpacaRequest('/v2/positions');
+    return (positions as AlpacaPosition[]) ?? [];
+  } catch {
+    return [];
+  }
+}
+
 interface OpenTrade {
   id: string;
   trader: string;
@@ -211,7 +261,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const { shouldClose, reason, pnl } = checkTradeTargets(typedTrade, currentPrice);
 
       if (shouldClose) {
-        // Close the trade
+        // Close the trade in Supabase
         const { error: updateError } = await supabase
           .from('trades')
           .update({
@@ -228,11 +278,91 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         } else {
           result.trades_closed++;
           dailyPnl += pnl;
+
+          // Also close on Alpaca (skip polymarket trades)
+          if (typedTrade.trader !== 'polymarket') {
+            const isCrypto = cryptoTickers.includes(symbol);
+            try {
+              await closeAlpacaPosition(symbol, isCrypto);
+              result.errors.push(`Alpaca position closed: ${symbol}`);
+            } catch (err) {
+              // Position might not exist on Alpaca (paper trades from before)
+              result.errors.push(`Alpaca close skipped for ${symbol}: ${String(err)}`);
+            }
+          }
         }
       }
     }
 
     result.total_pnl = dailyPnl;
+
+    // ── Sync Alpaca positions ──
+    // Fetch what Alpaca actually holds and check for positions that were
+    // stopped out or filled on Alpaca's side (bracket order legs)
+    try {
+      const alpacaPositions = await fetchAlpacaPositions();
+      if (alpacaPositions.length > 0) {
+        result.errors.push(`Alpaca holds ${alpacaPositions.length} position(s): ${alpacaPositions.map(p => `${p.symbol} ${p.qty}@${p.current_price} PnL:$${parseFloat(p.unrealized_pl).toFixed(2)}`).join(', ')}`);
+      }
+
+      // Check for Supabase open trades that no longer exist on Alpaca
+      // (meaning Alpaca closed them via SL/TP bracket legs)
+      const alpacaSymbolSet = new Set(alpacaPositions.map(p => p.symbol));
+      for (const trade of openTrades) {
+        if (trade.trader === 'polymarket') continue;
+        const sym = String(trade.asset).toUpperCase();
+        const isCrypto = cryptoTickers.includes(sym);
+        const alpacaSym = isCrypto ? `${sym}/USD` : sym;
+
+        // If we have an open trade in Supabase but Alpaca no longer holds it,
+        // it may have been closed by a bracket leg (SL/TP hit on Alpaca)
+        if (!alpacaSymbolSet.has(alpacaSym)) {
+          // Check if this trade has an alpaca_order_id (was actually placed on Alpaca)
+          const analystOutput = trade.analyst_output;
+          let hasAlpacaOrder = false;
+          try {
+            const parsed = typeof analystOutput === 'string' ? JSON.parse(analystOutput) : analystOutput;
+            hasAlpacaOrder = !!parsed?.alpaca_order_id;
+          } catch {
+            // ignore parse errors
+          }
+
+          if (hasAlpacaOrder) {
+            // Alpaca closed this position (SL/TP hit) — update Supabase
+            const cp = allPrices[sym];
+            if (cp !== undefined) {
+              const typedT: OpenTrade = {
+                id: trade.id, trader: trade.trader, asset: trade.asset,
+                direction: trade.direction, entry_price: Number(trade.entry_price),
+                stop_loss: Number(trade.stop_loss), take_profit: Number(trade.take_profit),
+                position_size_usd: Number(trade.position_size_usd),
+                quantity: Number(trade.quantity), opened_at: trade.opened_at,
+              };
+              const closePnl = typedT.direction === 'buy'
+                ? (cp - typedT.entry_price) * typedT.quantity
+                : (typedT.entry_price - cp) * typedT.quantity;
+
+              await supabase
+                .from('trades')
+                .update({
+                  status: 'closed',
+                  exit_price: cp,
+                  pnl_usd: closePnl,
+                  close_reason: 'alpaca_closed',
+                  closed_at: new Date().toISOString(),
+                })
+                .eq('id', trade.id);
+
+              result.trades_closed++;
+              dailyPnl += closePnl;
+              result.errors.push(`Alpaca-synced close for ${sym}: PnL $${closePnl.toFixed(2)}`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      result.errors.push(`Alpaca sync failed: ${String(err)}`);
+    }
 
     // 5. Update daily performance
     const today = new Date().toISOString().split('T')[0];

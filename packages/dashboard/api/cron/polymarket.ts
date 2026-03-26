@@ -133,6 +133,12 @@ function extractJSON<T = unknown>(raw: string): T {
   return JSON.parse(toParse) as T;
 }
 
+// ── Alpaca Execution ──
+// Polymarket trades are NOT executed on Alpaca. Polymarket uses its own CLOB
+// (Central Limit Order Book) on Polygon. For now, Polymarket remains paper-only
+// with trades recorded in Supabase. Alpaca execution is only wired into the
+// crypto and stocks traders which trade assets supported by Alpaca.
+
 // ── News data for spotting news-driven mispricing ──
 
 interface NewsArticle {

@@ -130,6 +130,56 @@ function extractJSON<T = unknown>(raw: string): T {
   return JSON.parse(toParse) as T;
 }
 
+// ── Alpaca Execution ──
+const ALPACA_BASE = 'https://paper-api.alpaca.markets';
+
+async function alpacaRequest(path: string, method = 'GET', body?: unknown) {
+  const key = process.env.ALPACA_API_KEY;
+  const secret = process.env.ALPACA_API_SECRET;
+  if (!key || !secret) return null;
+
+  const resp = await fetch(`${ALPACA_BASE}${path}`, {
+    method,
+    headers: {
+      'APCA-API-KEY-ID': key,
+      'APCA-API-SECRET-KEY': secret,
+      'Content-Type': 'application/json',
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Alpaca ${method} ${path}: ${resp.status} ${err}`);
+  }
+  return resp.json();
+}
+
+async function placeAlpacaOrder(symbol: string, side: 'buy' | 'sell', notional: number, stopLoss?: number, takeProfit?: number) {
+  // Stock symbols are used directly (AAPL, NVDA, etc.)
+  const orderBody: Record<string, unknown> = {
+    symbol,
+    side,
+    type: 'market',
+    time_in_force: 'day',
+    notional: notional.toFixed(2), // dollar amount for fractional shares
+  };
+
+  // Add bracket order legs for SL/TP if provided
+  if (stopLoss && takeProfit) {
+    orderBody.order_class = 'bracket';
+    orderBody.stop_loss = { stop_price: stopLoss.toFixed(2) };
+    orderBody.take_profit = { limit_price: takeProfit.toFixed(2) };
+  }
+
+  return alpacaRequest('/v2/orders', 'POST', orderBody);
+}
+
+async function closeAlpacaPosition(symbol: string) {
+  const encoded = encodeURIComponent(symbol);
+  return alpacaRequest(`/v2/positions/${encoded}`, 'DELETE');
+}
+
 // ── Stock trader logic ──
 
 const SONNET = 'claude-sonnet-4-6';
@@ -617,6 +667,14 @@ Analyze this stock market data and identify trading opportunities:\n\n${snapshot
 
       if (!closeErr) {
         result.errors.push(`AI closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
+        // Close on Alpaca
+        try {
+          await closeAlpacaPosition(rec.asset);
+          result.errors.push(`Alpaca position closed: ${rec.asset}`);
+        } catch (err) {
+          // Position might not exist on Alpaca (paper trades from before)
+          result.errors.push(`Alpaca close skipped for ${rec.asset}: ${String(err)}`);
+        }
       }
     }
 
@@ -691,13 +749,33 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
         continue;
       }
 
+      // Place order on Alpaca
+      const posSize = analyst.size_pct * 10;
+      let alpacaOrderId: string | null = null;
+      try {
+        const alpacaOrder = await placeAlpacaOrder(
+          opp.asset,
+          opp.direction as 'buy' | 'sell',
+          posSize,
+          analyst.stop_loss,
+          analyst.take_profit
+        );
+        alpacaOrderId = alpacaOrder?.id ?? null;
+        result.errors.push(`Alpaca order placed: ${alpacaOrderId}`);
+      } catch (err) {
+        result.errors.push(`Alpaca order failed: ${String(err)}`);
+      }
+
+      // Store Alpaca order ID in analyst_output JSONB
+      const analystWithAlpaca = { ...analyst, alpaca_order_id: alpacaOrderId };
+
       // Insert trade
       const { error: tradeError } = await supabase.from('trades').insert({
         trader: TRADER_NAME,
         asset: opp.asset,
         direction: opp.direction,
-        position_size_usd: analyst.size_pct * 10,
-        quantity: analyst.size_pct * 10 / analyst.entry_price,
+        position_size_usd: posSize,
+        quantity: posSize / analyst.entry_price,
         entry_price: analyst.entry_price,
         stop_loss: analyst.stop_loss,
         take_profit: analyst.take_profit,
@@ -708,7 +786,7 @@ Should we take this trade? Provide entry, stop-loss, and take-profit levels.`;
         analyst_cost: analystResponse.cost_usd,
         total_cost: totalInferenceCost,
         screener_output: JSON.stringify(opp),
-        analyst_output: JSON.stringify(analyst),
+        analyst_output: JSON.stringify(analystWithAlpaca),
         opened_at: new Date().toISOString(),
       });
 
