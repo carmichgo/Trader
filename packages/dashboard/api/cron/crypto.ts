@@ -142,17 +142,23 @@ const COIN_SYMBOLS: Record<string, string> = {
   binancecoin: 'BNB',
 };
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener AI. Analyze the provided market data and identify trading opportunities.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener AI for an autonomous paper trading system. Your job is to identify short-term trading opportunities based on the provided price data.
+
+IMPORTANT: This is paper trading — be proactive about finding setups. You should almost always find at least 1-2 opportunities from the data. Look for:
+- Momentum plays: assets with strong 24h moves that could continue
+- Mean reversion: assets that have dropped significantly and could bounce
+- Relative strength: assets outperforming or underperforming the group
+- Volatility plays: assets with unusual volume or price action
 
 Respond ONLY with a JSON array of opportunities. Each object must have:
-- asset: string (ticker symbol)
-- direction: "buy" | "sell" | "short"
+- asset: string (ticker symbol like "BTC", "ETH", etc.)
+- direction: "buy" or "sell"
 - score: number 0-100 (confidence/opportunity score)
-- estimated_edge_pct: number (estimated edge percentage)
-- win_probability: number 0-1
-- rationale: string (brief reasoning)
+- estimated_edge_pct: number (estimated edge percentage, e.g. 1.5 means 1.5%)
+- win_probability: number 0-1 (e.g. 0.65)
+- rationale: string (1-2 sentences explaining the setup)
 
-If no opportunities exist, return an empty array [].`;
+Return at least 1 opportunity if any asset shows noteworthy price action. Only return [] if ALL assets are completely flat with no signal.`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior crypto trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 
@@ -167,7 +173,7 @@ Respond ONLY with a JSON object:
 
 async function fetchCryptoData(): Promise<MarketData[]> {
   const ids = COIN_IDS.join(',');
-  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true`;
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true&include_last_updated_at=true`;
 
   const response = await fetch(url);
   if (!response.ok) {
