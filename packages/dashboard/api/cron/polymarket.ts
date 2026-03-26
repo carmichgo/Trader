@@ -166,30 +166,43 @@ const SONNET = 'claude-sonnet-4-6';
 const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'polymarket';
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are the Polymarket prediction market AI for a goal-driven autonomous trading system. You receive complete market data, portfolio context, and strategist directives.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are the Polymarket prediction market AI for a goal-driven autonomous trading system.
+
+CRITICAL — HOW POLYMARKET WORKS:
+- Markets resolve to 0¢ (NO) or 100¢ (YES) at their end date
+- "buy" = bet YES (you profit if event happens)
+- "sell" = bet NO (you profit if event does NOT happen)
+- A "sell" position at entry 99¢ means: we bet NO at 99¢. If the event doesn't happen (likely), we collect ~1¢ per share. This is a LOW-RISK bet that profits by waiting for resolution.
+- A "sell" position at entry 45¢ means: we bet NO at 45¢. We profit 45¢ per share if the event doesn't happen.
+
+CLOSING POLYMARKET POSITIONS:
+- DO NOT close positions just because you're confused about the entry price
+- "sell" positions PROFIT when the event DOESN'T happen — which means HOLD them until the resolution date
+- Only close a position if:
+  1. Breaking news makes the event MUCH more likely to happen (invalidating a NO bet)
+  2. Breaking news makes the event MUCH less likely (invalidating a YES bet)
+  3. The position can be sold at a profit NOW and the capital is needed elsewhere
+- If an event resolves in 5 days and our thesis hasn't changed, HOLD. That's 5 days from collecting the payout.
 
 You make TWO types of decisions:
-1. OPEN new positions — when you spot genuine probability mispricing with clear edge
-2. CLOSE existing positions — ONLY when the original thesis is invalidated or conditions materially changed
+1. OPEN new positions — when you spot probability mispricing
+2. CLOSE existing positions — ONLY when breaking news fundamentally changes the probability
 
 DECISION PRINCIPLES:
 - Every trade must serve THE GOAL. Know the target, timeline, and current progress.
-- Prediction markets resolve to 0 or 100. Position sizing must account for max loss = position size.
-- Opening: look for probability mispricing, information asymmetry, crowd overreaction, news catalysts
-- Closing: ONLY close if the thesis is BROKEN or conditions materially changed (new information, event outcome becoming clear).
-  Ask yourself: "Has something fundamentally changed since we entered?" If no, hold.
-- Position sizing: consider current capital, number of open positions, and max loss = full position
-- Learn from recent closed trades — don't repeat mistakes
+- Max loss on any position = the position size (binary outcome)
+- Look for: probability mispricing, information asymmetry, crowd overreaction, news catalysts
 - Respect max_event_horizon_days — skip events resolving after that
+- Learn from recent closed trades — don't repeat mistakes
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
 [
   {"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."},
-  {"asset":"existing-market","direction":"close","score":85,"estimated_edge_pct":0,"win_probability":0,"rationale":"Thesis broken because..."}
+  {"asset":"existing-market","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"Breaking news: [specific news] changed probability from X to Y"}
 ]
 
 - "buy" = bet YES, "sell" = bet NO, "close" = close an EXISTING position
-- For "close": explain specifically what changed since the position was opened
+- For "close": you MUST cite specific new information that changed the probability
 - Score: your confidence 0-100
 - If no action needed, return []`;
 
@@ -468,10 +481,11 @@ Strategy notes: ${directives?.strategy_notes ?? 'none'}
 ═══ SAFETY RAILS ═══
 ${safetyRails ? `Max daily drawdown: ${safetyRails.max_daily_drawdown_pct}% | Max per trade: ${safetyRails.max_single_trade_pct}% | Max concurrent positions: ${safetyRails.max_concurrent_positions}` : 'Default safety rails.'}
 
-═══ CURRENT OPEN POSITIONS ═══
+═══ CURRENT OPEN POSITIONS (DO NOT close unless breaking news changes the probability) ═══
 ${openPositions.length > 0 ? openPositions.map(t => {
   const holdHrs = ((Date.now() - new Date(t.opened_at as string).getTime()) / 3600000).toFixed(1);
-  return `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price} (held ${holdHrs}h)`;
+  const dirLabel = t.direction === 'sell' ? 'NO (profits if event DOES NOT happen)' : 'YES (profits if event happens)';
+  return `- ${t.asset}\n  Bet: ${dirLabel} | Size: $${t.position_size_usd} | Entry: ${t.entry_price}¢ | Held: ${holdHrs}h\n  → HOLD until resolution unless breaking news changes thesis`;
 }).join('\n') : 'No open positions.'}
 
 ═══ RECENT CLOSED TRADES (learn from these) ═══
