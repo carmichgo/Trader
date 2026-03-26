@@ -50,6 +50,9 @@ interface MarketData {
   change_24h_pct: number | null;
   volume_24h: number | null;
   market_cap: number | null;
+  open?: number | null;
+  high?: number | null;
+  low?: number | null;
 }
 
 // ── Inlined: Claude helpers ──
@@ -159,6 +162,86 @@ Respond ONLY with a JSON object:
 - confidence: number 0-100
 - reasoning: string (detailed analysis)`;
 
+// ── FRED Macro Data ──
+
+interface MacroData {
+  fedFundsRate: string | null;
+  yieldCurve: string | null;
+  vix: string | null;
+}
+
+async function fetchMacroData(): Promise<MacroData> {
+  try {
+    const apiKey = process.env.FRED_API_KEY;
+    if (!apiKey) return { fedFundsRate: null, yieldCurve: null, vix: null };
+
+    const seriesIds = ['DFF', 'T10Y2Y', 'VIXCLS'];
+    const results = await Promise.all(
+      seriesIds.map(async (id) => {
+        try {
+          const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${id}&limit=1&sort_order=desc&api_key=${apiKey}&file_type=json`;
+          const resp = await fetch(url);
+          if (!resp.ok) return null;
+          const data = await resp.json();
+          const obs = data?.observations?.[0] as { value: string } | undefined;
+          return obs?.value !== '.' ? (obs?.value ?? null) : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    return {
+      fedFundsRate: results[0] ?? null,
+      yieldCurve: results[1] ?? null,
+      vix: results[2] ?? null,
+    };
+  } catch {
+    return { fedFundsRate: null, yieldCurve: null, vix: null };
+  }
+}
+
+// ── Polygon.io Stock Data ──
+
+async function fetchStockDataPolygon(): Promise<MarketData[]> {
+  try {
+    const apiKey = process.env.POLYGON_API_KEY;
+    if (!apiKey) return [];
+
+    const results = await Promise.all(
+      STOCK_SYMBOLS.map(async (ticker) => {
+        try {
+          const url = `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${apiKey}`;
+          const resp = await fetch(url);
+          if (!resp.ok) return null;
+          const data = await resp.json();
+          const bar = data?.results?.[0];
+          if (!bar) return null;
+          const prevClose = bar.c ?? 0; // prev day close is the "current" price for prev-day bars
+          const open = bar.o ?? null;
+          const changePct = open && open > 0 ? ((prevClose - open) / open) * 100 : null;
+          return {
+            symbol: ticker,
+            price: prevClose,
+            change_24h_pct: changePct,
+            volume_24h: bar.v ?? null,
+            market_cap: null,
+            open: open,
+            high: bar.h ?? null,
+            low: bar.l ?? null,
+          } as MarketData;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    return results.filter((r): r is MarketData => r !== null);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Check if we're within US stock market hours (9:30-16:00 ET, Mon-Fri).
  */
@@ -178,9 +261,23 @@ function isMarketOpen(): boolean {
 }
 
 /**
- * Fetch stock quotes from Yahoo Finance v8 API (free, no key required).
+ * Fetch stock data: try Polygon.io first (real OHLCV), fall back to Yahoo Finance.
  */
 async function fetchStockData(): Promise<MarketData[]> {
+  // Try Polygon.io first (better data: real OHLCV, not delayed)
+  const polygonData = await fetchStockDataPolygon();
+  if (polygonData.length > 0) {
+    return polygonData;
+  }
+
+  // Fallback to Yahoo Finance
+  return fetchStockDataYahoo();
+}
+
+/**
+ * Fetch stock quotes from Yahoo Finance v8 API (free, no key required).
+ */
+async function fetchStockDataYahoo(): Promise<MarketData[]> {
   const symbols = STOCK_SYMBOLS.join(',');
   const url = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${symbols}&range=1d&interval=1d`;
 
@@ -248,22 +345,65 @@ async function fetchStockDataFallback(): Promise<MarketData[]> {
   }));
 }
 
-function buildMarketSnapshot(markets: MarketData[]): string {
+function buildMarketSnapshot(markets: MarketData[], macroData?: MacroData | null): string {
   const timestamp = new Date().toISOString();
   let snapshot = `US Stock Market Snapshot (${timestamp})\n\n`;
-  for (const m of markets) {
-    snapshot += `${m.symbol}: $${m.price.toFixed(2)}`;
-    if (m.change_24h_pct !== null) {
-      snapshot += ` | Day Change: ${m.change_24h_pct.toFixed(2)}%`;
-    }
-    if (m.volume_24h !== null) {
-      snapshot += ` | Volume: ${(m.volume_24h / 1e6).toFixed(1)}M`;
-    }
-    if (m.market_cap !== null) {
-      snapshot += ` | MCap: $${(m.market_cap / 1e9).toFixed(1)}B`;
-    }
-    snapshot += '\n';
+
+  // Column headers for OHLCV data if available
+  const hasOhlc = markets.some(m => m.open != null || m.high != null || m.low != null);
+  if (hasOhlc) {
+    snapshot += `${'Symbol'.padEnd(8)} ${'Price'.padEnd(10)} ${'Change'.padEnd(9)} ${'Open'.padEnd(10)} ${'High'.padEnd(10)} ${'Low'.padEnd(10)} ${'Volume(M)'.padEnd(10)}\n`;
+    snapshot += '-'.repeat(75) + '\n';
   }
+
+  for (const m of markets) {
+    if (hasOhlc) {
+      const priceStr = `$${m.price.toFixed(2)}`;
+      const changeStr = m.change_24h_pct !== null ? `${m.change_24h_pct >= 0 ? '+' : ''}${m.change_24h_pct.toFixed(2)}%` : 'N/A';
+      const openStr = m.open != null ? `$${m.open.toFixed(2)}` : 'N/A';
+      const highStr = m.high != null ? `$${m.high.toFixed(2)}` : 'N/A';
+      const lowStr = m.low != null ? `$${m.low.toFixed(2)}` : 'N/A';
+      const volStr = m.volume_24h != null ? `${(m.volume_24h / 1e6).toFixed(1)}` : 'N/A';
+      snapshot += `${m.symbol.padEnd(8)} ${priceStr.padEnd(10)} ${changeStr.padEnd(9)} ${openStr.padEnd(10)} ${highStr.padEnd(10)} ${lowStr.padEnd(10)} ${volStr.padEnd(10)}\n`;
+    } else {
+      snapshot += `${m.symbol}: $${m.price.toFixed(2)}`;
+      if (m.change_24h_pct !== null) {
+        snapshot += ` | Day Change: ${m.change_24h_pct.toFixed(2)}%`;
+      }
+      if (m.volume_24h !== null) {
+        snapshot += ` | Volume: ${(m.volume_24h / 1e6).toFixed(1)}M`;
+      }
+      if (m.market_cap !== null) {
+        snapshot += ` | MCap: $${(m.market_cap / 1e9).toFixed(1)}B`;
+      }
+      snapshot += '\n';
+    }
+  }
+
+  // Macro indicators from FRED
+  if (macroData && (macroData.fedFundsRate || macroData.yieldCurve || macroData.vix)) {
+    snapshot += `\nMACRO INDICATORS:\n`;
+    if (macroData.fedFundsRate) {
+      snapshot += `Fed Funds Rate: ${macroData.fedFundsRate}%\n`;
+    }
+    if (macroData.yieldCurve) {
+      const ycVal = parseFloat(macroData.yieldCurve);
+      const ycLabel = ycVal < 0 ? 'inverted — recession signal' :
+                      ycVal < 0.2 ? 'flat — caution' :
+                      'normal — no recession signal';
+      snapshot += `Yield Curve (10Y-2Y): ${macroData.yieldCurve}% (${ycLabel})\n`;
+    }
+    if (macroData.vix) {
+      const vixVal = parseFloat(macroData.vix);
+      const vixLabel = vixVal < 15 ? 'very low volatility — strong risk-on' :
+                       vixVal < 20 ? 'low volatility — risk-on environment' :
+                       vixVal < 25 ? 'moderate volatility' :
+                       vixVal < 30 ? 'elevated volatility — caution' :
+                       'high volatility — risk-off environment';
+      snapshot += `VIX: ${macroData.vix} (${vixLabel})\n`;
+    }
+  }
+
   return snapshot;
 }
 
@@ -369,14 +509,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // 1. Fetch market data
-    const markets = await fetchStockData();
+    // 1. Fetch market data and macro data in parallel
+    const [markets, macroData] = await Promise.all([
+      fetchStockData(),
+      fetchMacroData(),
+    ]);
     if (markets.length === 0) {
       result.errors.push('No stock data returned');
       return res.status(200).json(result);
     }
 
-    const snapshot = buildMarketSnapshot(markets);
+    const snapshot = buildMarketSnapshot(markets, macroData);
 
     // 2. Build screener prompt with strategist directives
     const strategistContext = directives

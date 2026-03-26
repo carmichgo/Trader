@@ -133,6 +133,27 @@ function extractJSON<T = unknown>(raw: string): T {
   return JSON.parse(toParse) as T;
 }
 
+// ── News data for spotting news-driven mispricing ──
+
+interface NewsArticle {
+  source: { name: string };
+  title: string;
+}
+
+async function fetchNews(): Promise<NewsArticle[]> {
+  try {
+    const apiKey = process.env.NEWSAPI_KEY;
+    if (!apiKey) return [];
+    const url = `https://newsapi.org/v2/top-headlines?category=general&pageSize=10&language=en&apiKey=${apiKey}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data?.articles ?? []).slice(0, 10) as NewsArticle[];
+  } catch {
+    return [];
+  }
+}
+
 // ── Polymarket trader logic ──
 
 const SONNET = 'claude-sonnet-4-6';

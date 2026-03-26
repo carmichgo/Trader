@@ -174,6 +174,79 @@ Respond ONLY with a JSON object:
 - confidence: number 0-100
 - reasoning: string (detailed analysis)`;
 
+// ── News, Macro, and DeFi data fetching ──
+
+interface NewsArticle {
+  source: { name: string };
+  title: string;
+}
+
+async function fetchCryptoNews(): Promise<NewsArticle[]> {
+  try {
+    const apiKey = process.env.NEWSAPI_KEY;
+    if (!apiKey) return [];
+    const url = `https://newsapi.org/v2/everything?q=bitcoin OR ethereum OR crypto&sortBy=publishedAt&pageSize=5&apiKey=${apiKey}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data?.articles ?? []).slice(0, 5) as NewsArticle[];
+  } catch {
+    return [];
+  }
+}
+
+interface FredObservation {
+  date: string;
+  value: string;
+}
+
+async function fetchCryptoMacroData(): Promise<{ fedFundsRate: string | null; vix: string | null }> {
+  try {
+    const apiKey = process.env.FRED_API_KEY;
+    if (!apiKey) return { fedFundsRate: null, vix: null };
+
+    const seriesIds = ['DFF', 'VIXCLS'];
+    const results = await Promise.all(
+      seriesIds.map(async (id) => {
+        try {
+          const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${id}&limit=1&sort_order=desc&api_key=${apiKey}&file_type=json`;
+          const resp = await fetch(url);
+          if (!resp.ok) return null;
+          const data = await resp.json();
+          const obs = data?.observations?.[0] as FredObservation | undefined;
+          return obs?.value !== '.' ? (obs?.value ?? null) : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    return { fedFundsRate: results[0] ?? null, vix: results[1] ?? null };
+  } catch {
+    return { fedFundsRate: null, vix: null };
+  }
+}
+
+interface DeFiProtocol {
+  name: string;
+  tvl: number;
+}
+
+async function fetchDeFiData(): Promise<{ totalTvl: number | null; topProtocols: DeFiProtocol[] }> {
+  try {
+    const resp = await fetch('https://api.llama.fi/protocols');
+    if (!resp.ok) return { totalTvl: null, topProtocols: [] };
+    const protocols = await resp.json() as Array<{ name: string; tvl: number }>;
+    // Sort by TVL descending, take top 5
+    const sorted = [...protocols].sort((a, b) => (b.tvl ?? 0) - (a.tvl ?? 0));
+    const topProtocols = sorted.slice(0, 5).map(p => ({ name: p.name, tvl: p.tvl }));
+    const totalTvl = sorted.reduce((sum, p) => sum + (p.tvl ?? 0), 0);
+    return { totalTvl, topProtocols };
+  } catch {
+    return { totalTvl: null, topProtocols: [] };
+  }
+}
+
 // ── Data fetching from multiple free APIs ──
 
 interface BinanceTicker {
@@ -260,7 +333,7 @@ async function fetchCoinGeckoOHLC(coinId: string): Promise<number[][] | null> {
 
 async function fetchCryptoData(): Promise<MarketData[]> {
   // Fetch all data sources in parallel
-  const [binanceTickers, fundingRates, fearGreed, cgSimple] = await Promise.all([
+  const [binanceTickers, fundingRates, fearGreed, cgSimple, cryptoNews, cryptoMacro, defiData] = await Promise.all([
     fetchBinanceTickers(),
     fetchBinanceFunding(),
     fetchFearGreed(),
@@ -268,6 +341,9 @@ async function fetchCryptoData(): Promise<MarketData[]> {
     fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${COIN_IDS.join(',')}&vs_currencies=usd&include_market_cap=true`)
       .then(r => r.ok ? r.json() : {})
       .catch(() => ({})),
+    fetchCryptoNews(),
+    fetchCryptoMacroData(),
+    fetchDeFiData(),
   ]);
 
   // Fetch 7d OHLC for top 5 coins (for trend analysis)
@@ -314,9 +390,12 @@ async function fetchCryptoData(): Promise<MarketData[]> {
     });
   }
 
-  // Store fear/greed and OHLC for snapshot building
+  // Store auxiliary data for snapshot building
   (fetchCryptoData as unknown as Record<string, unknown>)._fearGreed = fearGreed;
   (fetchCryptoData as unknown as Record<string, unknown>)._ohlc = ohlcMap;
+  (fetchCryptoData as unknown as Record<string, unknown>)._news = cryptoNews;
+  (fetchCryptoData as unknown as Record<string, unknown>)._macro = cryptoMacro;
+  (fetchCryptoData as unknown as Record<string, unknown>)._defi = defiData;
 
   return markets;
 }
@@ -377,6 +456,46 @@ function buildMarketSnapshot(markets: MarketData[]): string {
                      rate < -0.05 ? 'VERY BEARISH (crowded short → potential short squeeze)' :
                      rate < -0.01 ? 'Bearish bias' : 'Neutral';
       snapshot += `  ${m.symbol}: ${rate.toFixed(4)}% — ${signal}\n`;
+    }
+  }
+
+  // Latest crypto news
+  const news = (fetchCryptoData as unknown as Record<string, unknown>)._news as NewsArticle[] | null;
+  if (news && news.length > 0) {
+    snapshot += `\nLATEST CRYPTO NEWS:\n`;
+    for (const article of news) {
+      snapshot += `- [${article.source?.name ?? 'Unknown'}] ${article.title}\n`;
+    }
+  }
+
+  // Macro indicators (Fed Funds Rate, VIX)
+  const macro = (fetchCryptoData as unknown as Record<string, unknown>)._macro as { fedFundsRate: string | null; vix: string | null } | null;
+  if (macro && (macro.fedFundsRate || macro.vix)) {
+    snapshot += `\nMACRO INDICATORS:\n`;
+    if (macro.fedFundsRate) {
+      snapshot += `Fed Funds Rate: ${macro.fedFundsRate}%\n`;
+    }
+    if (macro.vix) {
+      const vixVal = parseFloat(macro.vix);
+      const vixLabel = vixVal < 15 ? 'very low volatility — strong risk-on' :
+                       vixVal < 20 ? 'low volatility — risk-on environment' :
+                       vixVal < 25 ? 'moderate volatility' :
+                       vixVal < 30 ? 'elevated volatility — caution' :
+                       'high volatility — risk-off environment';
+      snapshot += `VIX: ${macro.vix} (${vixLabel})\n`;
+    }
+  }
+
+  // DeFi metrics
+  const defi = (fetchCryptoData as unknown as Record<string, unknown>)._defi as { totalTvl: number | null; topProtocols: DeFiProtocol[] } | null;
+  if (defi && (defi.totalTvl || defi.topProtocols.length > 0)) {
+    snapshot += `\nDEFI METRICS:\n`;
+    if (defi.totalTvl) {
+      snapshot += `Total DeFi TVL: $${(defi.totalTvl / 1e9).toFixed(1)}B\n`;
+    }
+    if (defi.topProtocols.length > 0) {
+      const protoStr = defi.topProtocols.map(p => `${p.name} ($${(p.tvl / 1e9).toFixed(1)}B)`).join(', ');
+      snapshot += `Top protocols: ${protoStr}\n`;
     }
   }
 
