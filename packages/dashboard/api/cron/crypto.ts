@@ -450,7 +450,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // DEDUP: Skip if we already scanned in the last 10 minutes
-    if (await hasRecentScan(TRADER_NAME, 10)) {
+    if (await hasRecentScan(TRADER_NAME, 5)) {
       return res.status(200).json({
         ...result,
         errors: ['Recent scan exists within 10 minutes. Skipping.'],
