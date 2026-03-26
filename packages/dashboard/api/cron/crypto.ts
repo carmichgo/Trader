@@ -203,31 +203,31 @@ const COIN_SYMBOLS: Record<string, string> = {
   'injective-protocol': 'INJ', sui: 'SUI', aptos: 'APT', celestia: 'TIA',
 };
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener for an autonomous AI trading system. You receive market data, open positions, and strategist directives.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are the crypto trading AI for a goal-driven autonomous system. You receive complete market data, portfolio context, and strategist directives.
 
-You have TWO jobs:
-1. FIND new trading opportunities (direction: "buy" or "sell")
-2. RECOMMEND closing existing positions if conditions have changed (direction: "close")
+You make TWO types of decisions:
+1. OPEN new positions — when you see a genuine opportunity with clear edge
+2. CLOSE existing positions — ONLY when the original thesis is invalidated
 
-Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly.
+DECISION PRINCIPLES:
+- Every trade must serve THE GOAL. Know the target, timeline, and current progress.
+- Opening: look for momentum, mean reversion, relative strength, funding rate signals, news catalysts
+- Closing: ONLY close if the thesis is BROKEN (not just drawdown). Small losses are normal in crypto.
+  Ask yourself: "Has something fundamentally changed since we entered?" If no, hold.
+- Position sizing: consider current capital, number of open positions, and the strategist's max_position_pct
+- Learn from recent closed trades — don't repeat mistakes
+- Every close costs fees + slippage in real trading. Closing at breakeven is a net loss.
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
 [
-  {"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"Momentum breakout..."},
-  {"asset":"SOL","direction":"close","score":82,"estimated_edge_pct":0,"win_probability":0,"rationale":"Momentum fading, close existing long to lock in gains"}
+  {"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"..."},
+  {"asset":"SOL","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"Thesis broken because..."}
 ]
 
-Rules:
-- direction "buy" or "sell" = open a NEW position
-- direction "close" = close an EXISTING open position (only use for assets listed in CURRENT OPEN POSITIONS)
-- score 0-100 reflects your confidence
-- IMPORTANT: Do NOT close positions just because the market is in "fear" or prices dipped slightly. Close ONLY if:
-  1. The position has hit or is about to hit its stop-loss
-  2. A fundamental thesis change occurred (major news, protocol hack, regulatory action)
-  3. A much better opportunity exists and capital is needed
-- Small drawdowns (-1% to -5%) are NORMAL in crypto. Hold through volatility unless the thesis is broken.
-- "Extreme Fear" is often a BUY signal, not a reason to close everything.
-- Follow the strategist's focus_assets and strategy_notes closely`;
+- direction: "buy", "sell" (new position), or "close" (exit existing position)
+- For "close": explain specifically what changed since the position was opened
+- Score: your confidence 0-100
+- If no action needed, return []`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior crypto trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 
@@ -580,9 +580,6 @@ function calculateNEV(
 
 // Daily cost cap: stop AI calls if we've spent more than this today
 const DAILY_COST_CAP_USD = 10.00;
-// Only run analyst on very high-confidence screener results
-const ANALYST_THRESHOLD_DEFAULT = 60;
-
 async function getDailyCostSoFar(): Promise<number> {
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
@@ -706,6 +703,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq('trader', TRADER_NAME);
     const openPositions = openTrades ?? [];
 
+    // Fetch full context for AI
+    const { data: goalData } = await supabase
+      .from('goals')
+      .select('*')
+      .eq('is_active', true)
+      .limit(1);
+    const goal = goalData?.[0];
+
+    const { data: latestSnapshot } = await supabase
+      .from('portfolio_snapshots')
+      .select('total_capital')
+      .order('time', { ascending: false })
+      .limit(1);
+    const currentCapital = (latestSnapshot?.[0]?.total_capital as number) ?? (goal?.starting_capital as number) ?? 1000;
+
+    const { data: recentClosedTrades } = await supabase
+      .from('trades')
+      .select('asset, direction, gross_pnl, net_pnl, close_reason, entry_price, exit_price, opened_at, closed_at')
+      .eq('trader', TRADER_NAME)
+      .eq('status', 'closed')
+      .order('closed_at', { ascending: false })
+      .limit(5);
+
     // 1. Fetch market data
     let markets: MarketData[];
     try {
@@ -716,21 +736,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const snapshot = buildMarketSnapshot(markets);
 
-    // 2. Build screener prompt with strategist directives + open positions
-    const openPosContext = openPositions.length > 0
-      ? `\n\nCURRENT OPEN POSITIONS (DO NOT open duplicate positions for assets you already hold):\n${openPositions.map(t => `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price}`).join('\n')}`
-      : '\n\nNo current open positions.';
+    // 2. Build comprehensive context for AI
+    const fullContext = `
+═══ GOAL ═══
+${goal ? `Start: $${goal.starting_capital} → Target: $${goal.target_capital} in ${goal.time_horizon_days} days
+Started: ${goal.start_date} | Days elapsed: ${Math.floor((Date.now() - new Date(goal.start_date).getTime()) / 86400000)}
+Days remaining: ${Math.max(0, goal.time_horizon_days - Math.floor((Date.now() - new Date(goal.start_date).getTime()) / 86400000))}
+Current capital: $${currentCapital.toFixed(2)}
+Progress: ${(((currentCapital - goal.starting_capital) / (goal.target_capital - goal.starting_capital)) * 100).toFixed(1)}%` : 'No goal set.'}
 
-    const strategistContext = directives
-      ? `\n\nSTRATEGIST DIRECTIVES:
-- Risk posture: ${plan?.risk_posture ?? 'moderate'}
-- Confidence threshold: ${directives.confidence_threshold ?? 70} (only flag opportunities scoring above this)
-- Focus assets: ${directives.focus_assets?.join(', ') ?? 'any'}
-- Strategy notes: ${directives.strategy_notes ?? 'none'}
-- Daily P&L target: $${plan?.daily_target ?? 0}`
-      : '';
+═══ STRATEGIST DIRECTIVES ═══
+Risk posture: ${plan?.risk_posture ?? 'moderate'}
+Daily P&L target: $${plan?.daily_target ?? 0}
+Confidence threshold: ${directives?.confidence_threshold ?? 60}
+Focus assets: ${directives?.focus_assets?.join(', ') ?? 'any'}
+Strategy notes: ${directives?.strategy_notes ?? 'none'}
 
-    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT_BASE + openPosContext + strategistContext;
+═══ SAFETY RAILS ═══
+${safetyRails ? `Max daily drawdown: ${safetyRails.max_daily_drawdown_pct}% | Max per trade: ${safetyRails.max_single_trade_pct}% | Max concurrent positions: ${safetyRails.max_concurrent_positions}` : 'Default safety rails.'}
+
+═══ CURRENT OPEN POSITIONS ═══
+${openPositions.length > 0 ? openPositions.map(t => {
+  const holdHrs = ((Date.now() - new Date(t.opened_at as string).getTime()) / 3600000).toFixed(1);
+  return `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price} (held ${holdHrs}h)`;
+}).join('\n') : 'No open positions.'}
+
+═══ RECENT CLOSED TRADES (learn from these) ═══
+${(recentClosedTrades ?? []).length > 0 ? (recentClosedTrades ?? []).map((t: Record<string, unknown>) =>
+  \`- \${t.asset} \${t.direction}: entry $\${t.entry_price} → exit $\${t.exit_price} | P&L: $\${Number(t.net_pnl ?? 0).toFixed(2)} | reason: \${t.close_reason}\`
+).join('\n') : 'No recent trades.'}
+`;
+
+    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT_BASE + '\n' + fullContext;
 
     const screenerResponse = await callClaude(
       SONNET,
@@ -761,38 +798,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // Separate close recommendations from new trade opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 80); // High bar for closing
-    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
+    const closeRecs = opportunities.filter((o) => o.direction === 'close');
+    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 30);
 
-    // Process close recommendations with strict guards
+    // Process close recommendations — AI has full context and makes all decisions
     for (const rec of closeRecs) {
       // Find the matching open trade
       const matchingTrade = openPositions.find(t => t.asset === rec.asset);
       if (!matchingTrade) continue;
 
-      // GUARD: Minimum hold time — don't close trades opened less than 2 hours ago
-      const openedAt = new Date(matchingTrade.opened_at as string).getTime();
-      const holdTimeHours = (Date.now() - openedAt) / (1000 * 60 * 60);
-      if (holdTimeHours < 2) {
-        result.errors.push(`${rec.asset}: too new to close (held ${holdTimeHours.toFixed(1)}h, min 2h)`);
-        continue;
-      }
-
-      // Get current price for P&L calculation
+      // Calculate P&L for record keeping
       const marketItem = markets.find(m => m.symbol === rec.asset);
       const currentPrice = marketItem?.price ?? 0;
       const entryPrice = Number(matchingTrade.entry_price) || 0;
       const posSize = Number(matchingTrade.position_size_usd) || 0;
-      const pnlPct = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
       const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
       const totalCost = Number(matchingTrade.total_cost) || 0;
-
-      // GUARD: Don't close at breakeven or tiny loss — fees/slippage make this a guaranteed loss
-      // Only close if: profit > 1% OR loss > 3% (let winners run, cut real losers)
-      if (pnlPct > -3 && pnlPct < 1) {
-        result.errors.push(`${rec.asset}: P&L ${pnlPct.toFixed(2)}% too small to justify closing (need >+1% or <-3%)`);
-        continue;
-      }
 
       const { error: closeErr } = await supabase
         .from('trades')
@@ -825,8 +846,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const viable = newOpps;
     result.opportunities_found = viable.length;
 
-    // Analyst threshold from strategist (default 60)
-    const analystThreshold = directives?.confidence_threshold ?? ANALYST_THRESHOLD_DEFAULT;
+    // Analyst threshold from strategist
+    const analystThreshold = directives?.confidence_threshold ?? 50;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded
