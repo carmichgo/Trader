@@ -394,7 +394,7 @@ Based on the goal and current state, create the trading plan with per-trader dir
   await supabase.from('ai_decisions').insert({
     decision_type: 'strategist',
     trader: TRADER_NAME,
-    model: SONNET,
+    model: OPUS,
     prompt_tokens: response.input_tokens,
     completion_tokens: response.output_tokens,
     cost_usd: response.cost_usd,
