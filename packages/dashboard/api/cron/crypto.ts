@@ -50,6 +50,9 @@ interface MarketData {
   change_24h_pct: number | null;
   volume_24h: number | null;
   market_cap: number | null;
+  high_24h?: number | null;
+  low_24h?: number | null;
+  funding_rate?: string | null;
 }
 
 // ── Inlined: Claude helpers ──
@@ -133,13 +136,18 @@ const SONNET = 'claude-sonnet-4-6';
 const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'crypto';
 
-const COIN_IDS = ['bitcoin', 'ethereum', 'solana', 'avalanche-2', 'binancecoin'];
+const COIN_IDS = [
+  'bitcoin', 'ethereum', 'solana', 'avalanche-2', 'binancecoin',
+  'ripple', 'cardano', 'dogecoin', 'polkadot', 'chainlink',
+  'avalanche-2', 'uniswap', 'litecoin', 'near', 'arbitrum',
+  'render-token', 'injective-protocol', 'sui', 'aptos', 'celestia',
+];
 const COIN_SYMBOLS: Record<string, string> = {
-  bitcoin: 'BTC',
-  ethereum: 'ETH',
-  solana: 'SOL',
-  'avalanche-2': 'AVAX',
-  binancecoin: 'BNB',
+  bitcoin: 'BTC', ethereum: 'ETH', solana: 'SOL', 'avalanche-2': 'AVAX',
+  binancecoin: 'BNB', ripple: 'XRP', cardano: 'ADA', dogecoin: 'DOGE',
+  polkadot: 'DOT', chainlink: 'LINK', uniswap: 'UNI', litecoin: 'LTC',
+  near: 'NEAR', arbitrum: 'ARB', 'render-token': 'RNDR',
+  'injective-protocol': 'INJ', sui: 'SUI', aptos: 'APT', celestia: 'TIA',
 };
 
 const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener for an autonomous AI trading system. You receive market data and strategist directives, and identify trading opportunities.
@@ -166,47 +174,212 @@ Respond ONLY with a JSON object:
 - confidence: number 0-100
 - reasoning: string (detailed analysis)`;
 
-async function fetchCryptoData(): Promise<MarketData[]> {
-  const ids = COIN_IDS.join(',');
-  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true&include_last_updated_at=true`;
+// ── Data fetching from multiple free APIs ──
 
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`CoinGecko API error: ${response.status}`);
+interface BinanceTicker {
+  symbol: string;
+  lastPrice: string;
+  priceChangePercent: string;
+  highPrice: string;
+  lowPrice: string;
+  volume: string;
+  quoteVolume: string;
+}
+
+interface BinanceFunding {
+  symbol: string;
+  fundingRate: string;
+  fundingTime: number;
+}
+
+interface FearGreedData {
+  value: string;
+  value_classification: string;
+  timestamp: string;
+}
+
+async function fetchBinanceTickers(): Promise<Record<string, BinanceTicker>> {
+  try {
+    const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'AVAXUSDT', 'BNBUSDT',
+      'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'DOTUSDT', 'LINKUSDT',
+      'UNIUSDT', 'LTCUSDT', 'NEARUSDT', 'ARBUSDT', 'RNDRUSDT',
+      'INJUSDT', 'SUIUSDT', 'APTUSDT', 'TIAUSDT'];
+    const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${JSON.stringify(symbols)}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return {};
+    const data = await resp.json() as BinanceTicker[];
+    const map: Record<string, BinanceTicker> = {};
+    for (const t of data) {
+      const sym = t.symbol.replace('USDT', '');
+      map[sym] = t;
+    }
+    return map;
+  } catch {
+    return {};
   }
-  const data = await response.json();
+}
+
+async function fetchBinanceFunding(): Promise<Record<string, string>> {
+  try {
+    const url = 'https://fapi.binance.com/fapi/v1/premiumIndex';
+    const resp = await fetch(url);
+    if (!resp.ok) return {};
+    const data = await resp.json() as BinanceFunding[];
+    const map: Record<string, string> = {};
+    for (const f of data) {
+      const sym = f.symbol.replace('USDT', '');
+      map[sym] = f.fundingRate;
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
+async function fetchFearGreed(): Promise<FearGreedData | null> {
+  try {
+    const resp = await fetch('https://api.alternative.me/fng/?limit=1');
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data?.data?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCoinGeckoOHLC(coinId: string): Promise<number[][] | null> {
+  try {
+    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=7`;
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCryptoData(): Promise<MarketData[]> {
+  // Fetch all data sources in parallel
+  const [binanceTickers, fundingRates, fearGreed, cgSimple] = await Promise.all([
+    fetchBinanceTickers(),
+    fetchBinanceFunding(),
+    fetchFearGreed(),
+    // CoinGecko for market caps (Binance doesn't have this)
+    fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${COIN_IDS.join(',')}&vs_currencies=usd&include_market_cap=true`)
+      .then(r => r.ok ? r.json() : {})
+      .catch(() => ({})),
+  ]);
+
+  // Fetch 7d OHLC for top 5 coins (for trend analysis)
+  const ohlcPromises = ['bitcoin', 'ethereum', 'solana'].map(async (id) => {
+    const ohlc = await fetchCoinGeckoOHLC(id);
+    return { id, ohlc };
+  });
+  const ohlcResults = await Promise.all(ohlcPromises);
+  const ohlcMap: Record<string, number[][]> = {};
+  for (const r of ohlcResults) {
+    if (r.ohlc) ohlcMap[COIN_SYMBOLS[r.id] ?? r.id] = r.ohlc;
+  }
 
   const markets: MarketData[] = [];
+  const seen = new Set<string>();
+
   for (const coinId of COIN_IDS) {
-    const coin = data[coinId];
-    if (!coin) continue;
+    const symbol = COIN_SYMBOLS[coinId] ?? coinId.toUpperCase();
+    if (seen.has(symbol)) continue;
+    seen.add(symbol);
+
+    const binance = binanceTickers[symbol];
+    const cgCoin = (cgSimple as Record<string, Record<string, number>>)[coinId];
+
+    if (!binance && !cgCoin) continue;
+
+    const price = binance ? parseFloat(binance.lastPrice) : (cgCoin?.usd ?? 0);
+    const change24h = binance ? parseFloat(binance.priceChangePercent) : null;
+    const volume = binance ? parseFloat(binance.quoteVolume) : null;
+    const high24h = binance ? parseFloat(binance.highPrice) : null;
+    const low24h = binance ? parseFloat(binance.lowPrice) : null;
+    const mcap = cgCoin?.usd_market_cap ?? null;
+    const funding = fundingRates[symbol] ?? null;
+
     markets.push({
-      symbol: COIN_SYMBOLS[coinId] ?? coinId.toUpperCase(),
-      price: coin.usd ?? 0,
-      change_24h_pct: coin.usd_24h_change ?? null,
-      volume_24h: coin.usd_24h_vol ?? null,
-      market_cap: coin.usd_market_cap ?? null,
+      symbol,
+      price,
+      change_24h_pct: change24h,
+      volume_24h: volume,
+      market_cap: mcap,
+      high_24h: high24h,
+      low_24h: low24h,
+      funding_rate: funding,
     });
   }
+
+  // Store fear/greed and OHLC for snapshot building
+  (fetchCryptoData as unknown as Record<string, unknown>)._fearGreed = fearGreed;
+  (fetchCryptoData as unknown as Record<string, unknown>)._ohlc = ohlcMap;
+
   return markets;
 }
 
 function buildMarketSnapshot(markets: MarketData[]): string {
   const timestamp = new Date().toISOString();
-  let snapshot = `Crypto Market Snapshot (${timestamp})\n\n`;
-  for (const m of markets) {
-    snapshot += `${m.symbol}: $${m.price.toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
-    if (m.change_24h_pct !== null) {
-      snapshot += ` | 24h Change: ${m.change_24h_pct.toFixed(2)}%`;
-    }
-    if (m.volume_24h !== null) {
-      snapshot += ` | 24h Vol: $${(m.volume_24h / 1e6).toFixed(1)}M`;
-    }
-    if (m.market_cap !== null) {
-      snapshot += ` | MCap: $${(m.market_cap / 1e9).toFixed(1)}B`;
-    }
-    snapshot += '\n';
+  const fearGreed = (fetchCryptoData as unknown as Record<string, unknown>)._fearGreed as FearGreedData | null;
+  const ohlcMap = (fetchCryptoData as unknown as Record<string, unknown>)._ohlc as Record<string, number[][]> | null;
+
+  let snapshot = `CRYPTO MARKET SNAPSHOT (${timestamp})\n`;
+
+  // Market sentiment
+  if (fearGreed) {
+    snapshot += `\nFear & Greed Index: ${fearGreed.value}/100 (${fearGreed.value_classification})\n`;
   }
+
+  // Price table
+  snapshot += `\n${'Symbol'.padEnd(8)} ${'Price'.padEnd(12)} ${'24h%'.padEnd(9)} ${'24h High'.padEnd(12)} ${'24h Low'.padEnd(12)} ${'Volume($M)'.padEnd(12)} ${'Funding'.padEnd(10)} ${'MCap($B)'.padEnd(10)}\n`;
+  snapshot += '-'.repeat(95) + '\n';
+
+  for (const m of markets) {
+    const priceStr = m.price >= 1000 ? `$${m.price.toLocaleString('en-US', { maximumFractionDigits: 0 })}` :
+                     m.price >= 1 ? `$${m.price.toFixed(2)}` : `$${m.price.toFixed(4)}`;
+    const changeStr = m.change_24h_pct !== null ? `${m.change_24h_pct >= 0 ? '+' : ''}${m.change_24h_pct.toFixed(2)}%` : 'N/A';
+    const highStr = m.high_24h != null ? `$${m.high_24h >= 1000 ? m.high_24h.toLocaleString('en-US', { maximumFractionDigits: 0 }) : m.high_24h.toFixed(2)}` : 'N/A';
+    const lowStr = m.low_24h != null ? `$${m.low_24h >= 1000 ? m.low_24h.toLocaleString('en-US', { maximumFractionDigits: 0 }) : m.low_24h.toFixed(2)}` : 'N/A';
+    const volStr = m.volume_24h != null ? `${(m.volume_24h / 1e6).toFixed(1)}` : 'N/A';
+    const fundingStr = m.funding_rate != null ? `${(parseFloat(m.funding_rate) * 100).toFixed(4)}%` : 'N/A';
+    const mcapStr = m.market_cap != null ? `${(m.market_cap / 1e9).toFixed(1)}` : 'N/A';
+
+    snapshot += `${m.symbol.padEnd(8)} ${priceStr.padEnd(12)} ${changeStr.padEnd(9)} ${highStr.padEnd(12)} ${lowStr.padEnd(12)} ${volStr.padEnd(12)} ${fundingStr.padEnd(10)} ${mcapStr.padEnd(10)}\n`;
+  }
+
+  // 7-day trend for top coins
+  if (ohlcMap && Object.keys(ohlcMap).length > 0) {
+    snapshot += `\n7-DAY PRICE TREND (daily closes):\n`;
+    for (const [sym, candles] of Object.entries(ohlcMap)) {
+      if (!candles || candles.length < 2) continue;
+      // Get daily closes (last 7 candles at daily granularity)
+      const dailyCloses = candles.filter((_, i) => i % 6 === 0).slice(-7).map(c => c[4]); // close price
+      if (dailyCloses.length < 2) continue;
+      const weekAgo = dailyCloses[0]!;
+      const now = dailyCloses[dailyCloses.length - 1]!;
+      const weekChange = ((now - weekAgo) / weekAgo * 100).toFixed(2);
+      const trend = dailyCloses.map(p => `$${p >= 1000 ? Math.round(p).toLocaleString() : p.toFixed(2)}`).join(' → ');
+      snapshot += `${sym}: ${trend} (7d: ${Number(weekChange) >= 0 ? '+' : ''}${weekChange}%)\n`;
+    }
+  }
+
+  // Funding rate analysis
+  const highFunding = markets.filter(m => m.funding_rate != null && Math.abs(parseFloat(m.funding_rate!)) > 0.0005);
+  if (highFunding.length > 0) {
+    snapshot += `\nNOTABLE FUNDING RATES (potential mean reversion signals):\n`;
+    for (const m of highFunding) {
+      const rate = parseFloat(m.funding_rate!) * 100;
+      const signal = rate > 0.05 ? 'VERY BULLISH (crowded long → potential short squeeze risk)' :
+                     rate > 0.01 ? 'Bullish bias' :
+                     rate < -0.05 ? 'VERY BEARISH (crowded short → potential short squeeze)' :
+                     rate < -0.01 ? 'Bearish bias' : 'Neutral';
+      snapshot += `  ${m.symbol}: ${rate.toFixed(4)}% — ${signal}\n`;
+    }
+  }
+
   return snapshot;
 }
 
