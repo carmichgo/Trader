@@ -396,7 +396,7 @@ function calculateNEV(
 // Daily cost cap: stop AI calls if we've spent more than this today
 const DAILY_COST_CAP_USD = 10.00;
 // Only run analyst on very high-confidence screener results
-const ANALYST_THRESHOLD = 85;
+const ANALYST_THRESHOLD_DEFAULT = 60;
 
 async function getDailyCostSoFar(): Promise<number> {
   const todayStart = new Date();
@@ -569,9 +569,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     result.opportunities_found = viable.length;
 
     // 3. Only deep-analyze high-scoring opportunities (saves cost)
-    const analystThreshold = directives?.confidence_threshold
-      ? Math.max(directives.confidence_threshold, ANALYST_THRESHOLD)
-      : ANALYST_THRESHOLD;
+    // Use strategist's threshold if available, otherwise default
+    const analystThreshold = directives?.confidence_threshold ?? ANALYST_THRESHOLD_DEFAULT;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded

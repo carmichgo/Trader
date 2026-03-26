@@ -428,8 +428,8 @@ Analyze this stock market data and identify trading opportunities:\n\n${snapshot
 
     // 3. Deep-analyze high-scoring opportunities
     const analystThreshold = directives?.confidence_threshold
-      ? Math.max(directives.confidence_threshold, 85)
-      : 90;
+      ? directives.confidence_threshold
+      : 60;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded
