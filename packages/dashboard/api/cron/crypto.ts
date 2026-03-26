@@ -18,7 +18,7 @@ interface ClaudeResponse {
 
 interface ScreenerOpportunity {
   asset: string;
-  direction: 'buy' | 'sell' | 'short';
+  direction: 'buy' | 'sell' | 'short' | 'close';
   score: number;
   estimated_edge_pct: number;
   win_probability: number;
@@ -698,7 +698,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Fetch current open positions to avoid duplicates
     const { data: openTrades } = await supabase
       .from('trades')
-      .select('asset, direction, position_size_usd, entry_price, opened_at')
+      .select('asset, direction, position_size_usd, entry_price, opened_at, total_cost')
       .eq('status', 'open')
       .eq('trader', TRADER_NAME);
     const openPositions = openTrades ?? [];
@@ -763,7 +763,7 @@ ${openPositions.length > 0 ? openPositions.map(t => {
 
 ═══ RECENT CLOSED TRADES (learn from these) ═══
 ${(recentClosedTrades ?? []).length > 0 ? (recentClosedTrades ?? []).map((t: Record<string, unknown>) =>
-  \`- \${t.asset} \${t.direction}: entry $\${t.entry_price} → exit $\${t.exit_price} | P&L: $\${Number(t.net_pnl ?? 0).toFixed(2)} | reason: \${t.close_reason}\`
+  `- ${t.asset} ${t.direction}: entry $${t.entry_price} → exit $${t.exit_price} | P&L: $${Number(t.net_pnl ?? 0).toFixed(2)} | reason: ${t.close_reason}`
 ).join('\n') : 'No recent trades.'}
 `;
 

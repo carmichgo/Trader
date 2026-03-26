@@ -18,7 +18,7 @@ interface ClaudeResponse {
 
 interface ScreenerOpportunity {
   asset: string;
-  direction: 'buy' | 'sell' | 'short';
+  direction: 'buy' | 'sell' | 'short' | 'close';
   score: number;
   estimated_edge_pct: number;
   win_probability: number;
@@ -166,27 +166,32 @@ const SONNET = 'claude-sonnet-4-6';
 const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'polymarket';
 
-const SCREENER_SYSTEM_PROMPT = `You are a Polymarket prediction market screener for an autonomous AI trading system.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are the Polymarket prediction market AI for a goal-driven autonomous trading system. You receive complete market data, portfolio context, and strategist directives.
 
-You have TWO jobs:
-1. FIND mispriced events to open new positions (direction: "buy" or "sell")
-2. RECOMMEND closing existing positions if conditions changed (direction: "close")
+You make TWO types of decisions:
+1. OPEN new positions — when you spot genuine probability mispricing with clear edge
+2. CLOSE existing positions — ONLY when the original thesis is invalidated or conditions materially changed
 
-Your behavior is driven by the STRATEGIST DIRECTIVES below.
+DECISION PRINCIPLES:
+- Every trade must serve THE GOAL. Know the target, timeline, and current progress.
+- Prediction markets resolve to 0 or 100. Position sizing must account for max loss = position size.
+- Opening: look for probability mispricing, information asymmetry, crowd overreaction, news catalysts
+- Closing: ONLY close if the thesis is BROKEN or conditions materially changed (new information, event outcome becoming clear).
+  Ask yourself: "Has something fundamentally changed since we entered?" If no, hold.
+- Position sizing: consider current capital, number of open positions, and max loss = full position
+- Learn from recent closed trades — don't repeat mistakes
+- Respect max_event_horizon_days — skip events resolving after that
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
 [
   {"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."},
-  {"asset":"existing-market","direction":"close","score":85,"estimated_edge_pct":0,"win_probability":0,"rationale":"News changed the odds, close to lock in profit"}
+  {"asset":"existing-market","direction":"close","score":85,"estimated_edge_pct":0,"win_probability":0,"rationale":"Thesis broken because..."}
 ]
 
-Rules:
 - "buy" = bet YES, "sell" = bet NO, "close" = close an EXISTING position
-- Only use "close" for assets listed in CURRENT OPEN POSITIONS
-- For close decisions: has news changed the odds? Is the event about to resolve? Has the market moved in our favor enough to take profit?
-- Respect max_event_horizon_days — skip events resolving after that
-- Look for: probability mispricing, information asymmetry, crowd overreaction
-- Always review open positions and recommend closing any that no longer make sense`;
+- For "close": explain specifically what changed since the position was opened
+- Score: your confidence 0-100
+- If no action needed, return []`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior prediction markets analyst AI. You receive a Polymarket opportunity and must decide whether to take the trade.
 
@@ -392,6 +397,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq('trader', 'polymarket');
     const openPositions = openTrades ?? [];
 
+    // Fetch full context for AI
+    const { data: goalData } = await supabase
+      .from('goals')
+      .select('*')
+      .eq('is_active', true)
+      .limit(1);
+    const goal = goalData?.[0];
+
+    const { data: latestSnapshot } = await supabase
+      .from('portfolio_snapshots')
+      .select('total_capital')
+      .order('time', { ascending: false })
+      .limit(1);
+    const currentCapital = (latestSnapshot?.[0]?.total_capital as number) ?? (goal?.starting_capital as number) ?? 1000;
+
+    const { data: recentClosedTrades } = await supabase
+      .from('trades')
+      .select('asset, direction, gross_pnl, net_pnl, close_reason, entry_price, exit_price, opened_at, closed_at')
+      .eq('trader', TRADER_NAME)
+      .eq('status', 'closed')
+      .order('closed_at', { ascending: false })
+      .limit(5);
+
     // 1. Fetch Polymarket data and news in parallel
     const [markets, newsArticles] = await Promise.all([
       fetchPolymarkets(),
@@ -420,23 +448,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const snapshot = buildMarketSnapshot(filteredMarkets, newsArticles);
 
-    // 2. Build screener prompt with strategist directives
-    const strategistContext = directives
-      ? `\n\nSTRATEGIST DIRECTIVES:
-- Risk posture: ${plan?.risk_posture ?? 'moderate'}
-- Confidence threshold: ${directives.confidence_threshold ?? 70} (only flag opportunities scoring above this)
-- Max event horizon: ${directives.max_event_horizon_days ?? 'unlimited'} days (only analyze events resolving within this timeframe)
-- Focus categories: ${directives.focus_categories?.join(', ') ?? 'any'}
-- Strategy notes: ${directives.strategy_notes ?? 'none'}
-- Daily P&L target: $${plan?.daily_target ?? 0}
-- Max position size: ${directives.max_position_pct ?? 10}% of allocation per trade`
-      : '';
+    // 2. Build comprehensive context for AI
+    const fullContext = `
+═══ GOAL ═══
+${goal ? `Start: $${goal.starting_capital} → Target: $${goal.target_capital} in ${goal.time_horizon_days} days
+Started: ${goal.start_date} | Days elapsed: ${Math.floor((Date.now() - new Date(goal.start_date).getTime()) / 86400000)}
+Days remaining: ${Math.max(0, goal.time_horizon_days - Math.floor((Date.now() - new Date(goal.start_date).getTime()) / 86400000))}
+Current capital: $${currentCapital.toFixed(2)}
+Progress: ${(((currentCapital - (goal.starting_capital as number)) / ((goal.target_capital as number) - (goal.starting_capital as number))) * 100).toFixed(1)}%` : 'No goal set.'}
 
-    const openPosContext = openPositions.length > 0
-      ? `\n\nCURRENT OPEN POSITIONS (DO NOT open duplicates):\n${openPositions.map((t: Record<string, unknown>) => `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price}`).join('\n')}`
-      : '';
+═══ STRATEGIST DIRECTIVES ═══
+Risk posture: ${plan?.risk_posture ?? 'moderate'}
+Daily P&L target: $${plan?.daily_target ?? 0}
+Confidence threshold: ${directives?.confidence_threshold ?? 60}
+Max event horizon: ${directives?.max_event_horizon_days ?? 'unlimited'} days
+Focus categories: ${directives?.focus_categories?.join(', ') ?? 'any'}
+Strategy notes: ${directives?.strategy_notes ?? 'none'}
 
-    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT + openPosContext + strategistContext;
+═══ SAFETY RAILS ═══
+${safetyRails ? `Max daily drawdown: ${safetyRails.max_daily_drawdown_pct}% | Max per trade: ${safetyRails.max_single_trade_pct}% | Max concurrent positions: ${safetyRails.max_concurrent_positions}` : 'Default safety rails.'}
+
+═══ CURRENT OPEN POSITIONS ═══
+${openPositions.length > 0 ? openPositions.map(t => {
+  const holdHrs = ((Date.now() - new Date(t.opened_at as string).getTime()) / 3600000).toFixed(1);
+  return `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price} (held ${holdHrs}h)`;
+}).join('\n') : 'No open positions.'}
+
+═══ RECENT CLOSED TRADES (learn from these) ═══
+${(recentClosedTrades ?? []).length > 0 ? (recentClosedTrades ?? []).map((t: Record<string, unknown>) =>
+  `- ${t.asset} ${t.direction}: entry $${t.entry_price} → exit $${t.exit_price} | P&L: $${Number(t.net_pnl ?? 0).toFixed(2)} | reason: ${t.close_reason}`
+).join('\n') : 'No recent trades.'}
+`;
+
+    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT_BASE + '\n' + fullContext;
 
     // 2. Screen with Sonnet
     const screenerResponse = await callClaude(
@@ -468,21 +512,13 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
     }
 
     // Separate close recommendations from new opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 85); // Very high bar for polymarket
-    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
+    const closeRecs = opportunities.filter((o) => o.direction === 'close');
+    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 30);
 
-    // Process close recommendations with strict guards
+    // Process close recommendations — AI has full context and makes all decisions
     for (const rec of closeRecs) {
       const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
       if (!matchingTrade) continue;
-
-      // GUARD: Minimum hold time (6 hours for polymarket — events need time to play out)
-      const openedAt = new Date(matchingTrade.opened_at as string).getTime();
-      const holdTimeHours = (Date.now() - openedAt) / (1000 * 60 * 60);
-      if (holdTimeHours < 6) {
-        result.errors.push(`${rec.asset}: too new to close (held ${holdTimeHours.toFixed(1)}h, min 6h)`);
-        continue;
-      }
 
       const { error: closeErr } = await supabase
         .from('trades')
@@ -505,7 +541,7 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
     result.opportunities_found = viable.length;
 
     // 3. Deep-analyze high-scoring opportunities
-    const analystThreshold = directives?.confidence_threshold ?? 60;
+    const analystThreshold = directives?.confidence_threshold ?? 50;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded
