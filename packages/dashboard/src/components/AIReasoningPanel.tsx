@@ -34,7 +34,11 @@ function DecisionRow({ decision }: { decision: AIDecision }) {
           {decision.trader}
         </span>
         <span className="text-xs text-gray-400 truncate flex-1">
-          {decision.input_summary ?? "No summary"}
+          {typeof decision.input_summary === 'string'
+            ? decision.input_summary
+            : decision.input_summary
+              ? JSON.stringify(decision.input_summary).slice(0, 100)
+              : "No summary"}
         </span>
         <span className="text-xs text-terminal-muted tabular-nums shrink-0">
           {decision.model}
@@ -89,7 +93,9 @@ function DecisionRow({ decision }: { decision: AIDecision }) {
             <div>
               <div className="text-xs text-terminal-muted mb-1">AI Output:</div>
               <pre className="bg-terminal-bg border border-terminal-border rounded-md p-3 text-xs text-gray-300 overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap">
-                {decision.output_raw}
+                {typeof decision.output_raw === 'string'
+                  ? decision.output_raw
+                  : JSON.stringify(decision.output_raw, null, 2)}
               </pre>
             </div>
           )}
