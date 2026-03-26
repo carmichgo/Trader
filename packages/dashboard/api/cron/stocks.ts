@@ -571,7 +571,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Fetch current open positions to avoid duplicates
     const { data: openTrades } = await supabase
       .from('trades')
-      .select('asset, direction, position_size_usd, entry_price')
+      .select('asset, direction, position_size_usd, entry_price, opened_at')
       .eq('status', 'open')
       .eq('trader', 'stocks');
     const openPositions = openTrades ?? [];
@@ -636,19 +636,34 @@ Analyze this stock market data and identify trading opportunities:\n\n${snapshot
     }
 
     // Separate close recommendations from new opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 50);
+    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 80);
     const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
 
-    // Process close recommendations
+    // Process close recommendations with strict guards
     for (const rec of closeRecs) {
       const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
       if (!matchingTrade) continue;
+
+      // GUARD: Minimum hold time (4 hours for stocks)
+      const openedAt = new Date(matchingTrade.opened_at as string).getTime();
+      const holdTimeHours = (Date.now() - openedAt) / (1000 * 60 * 60);
+      if (holdTimeHours < 4) {
+        result.errors.push(`${rec.asset}: too new to close (held ${holdTimeHours.toFixed(1)}h, min 4h)`);
+        continue;
+      }
 
       const marketItem = markets.find(m => m.symbol === rec.asset);
       const currentPrice = marketItem?.price ?? 0;
       const entryPrice = Number(matchingTrade.entry_price) || 0;
       const posSize = Number(matchingTrade.position_size_usd) || 0;
+      const pnlPct = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
       const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
+
+      // GUARD: Only close if profit > 1% or loss > 3%
+      if (pnlPct > -3 && pnlPct < 1) {
+        result.errors.push(`${rec.asset}: P&L ${pnlPct.toFixed(2)}% too small to close (need >+1% or <-3%)`);
+        continue;
+      }
 
       const { error: closeErr } = await supabase
         .from('trades')

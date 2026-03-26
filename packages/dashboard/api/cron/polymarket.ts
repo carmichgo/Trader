@@ -387,7 +387,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Fetch current open positions to avoid duplicates
     const { data: openTrades } = await supabase
       .from('trades')
-      .select('asset, direction, position_size_usd, entry_price')
+      .select('asset, direction, position_size_usd, entry_price, opened_at')
       .eq('status', 'open')
       .eq('trader', 'polymarket');
     const openPositions = openTrades ?? [];
@@ -468,13 +468,21 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
     }
 
     // Separate close recommendations from new opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 50);
+    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 85); // Very high bar for polymarket
     const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
 
-    // Process close recommendations
+    // Process close recommendations with strict guards
     for (const rec of closeRecs) {
       const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
       if (!matchingTrade) continue;
+
+      // GUARD: Minimum hold time (6 hours for polymarket — events need time to play out)
+      const openedAt = new Date(matchingTrade.opened_at as string).getTime();
+      const holdTimeHours = (Date.now() - openedAt) / (1000 * 60 * 60);
+      if (holdTimeHours < 6) {
+        result.errors.push(`${rec.asset}: too new to close (held ${holdTimeHours.toFixed(1)}h, min 6h)`);
+        continue;
+      }
 
       const { error: closeErr } = await supabase
         .from('trades')

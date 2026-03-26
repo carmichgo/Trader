@@ -701,7 +701,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Fetch current open positions to avoid duplicates
     const { data: openTrades } = await supabase
       .from('trades')
-      .select('asset, direction, position_size_usd, entry_price')
+      .select('asset, direction, position_size_usd, entry_price, opened_at')
       .eq('status', 'open')
       .eq('trader', TRADER_NAME);
     const openPositions = openTrades ?? [];
@@ -761,21 +761,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // Separate close recommendations from new trade opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 50);
+    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 80); // High bar for closing
     const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
 
-    // Process close recommendations first
+    // Process close recommendations with strict guards
     for (const rec of closeRecs) {
       // Find the matching open trade
       const matchingTrade = openPositions.find(t => t.asset === rec.asset);
       if (!matchingTrade) continue;
+
+      // GUARD: Minimum hold time — don't close trades opened less than 2 hours ago
+      const openedAt = new Date(matchingTrade.opened_at as string).getTime();
+      const holdTimeHours = (Date.now() - openedAt) / (1000 * 60 * 60);
+      if (holdTimeHours < 2) {
+        result.errors.push(`${rec.asset}: too new to close (held ${holdTimeHours.toFixed(1)}h, min 2h)`);
+        continue;
+      }
 
       // Get current price for P&L calculation
       const marketItem = markets.find(m => m.symbol === rec.asset);
       const currentPrice = marketItem?.price ?? 0;
       const entryPrice = Number(matchingTrade.entry_price) || 0;
       const posSize = Number(matchingTrade.position_size_usd) || 0;
+      const pnlPct = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
       const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
+      const totalCost = Number(matchingTrade.total_cost) || 0;
+
+      // GUARD: Don't close at breakeven or tiny loss — fees/slippage make this a guaranteed loss
+      // Only close if: profit > 1% OR loss > 3% (let winners run, cut real losers)
+      if (pnlPct > -3 && pnlPct < 1) {
+        result.errors.push(`${rec.asset}: P&L ${pnlPct.toFixed(2)}% too small to justify closing (need >+1% or <-3%)`);
+        continue;
+      }
 
       const { error: closeErr } = await supabase
         .from('trades')
@@ -784,7 +801,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           close_reason: 'signal_reversal',
           exit_price: currentPrice,
           gross_pnl: pnl,
-          net_pnl: pnl - (Number(matchingTrade.total_cost) || 0),
+          net_pnl: pnl - totalCost,
           closed_at: new Date().toISOString(),
         })
         .eq('asset', rec.asset)
