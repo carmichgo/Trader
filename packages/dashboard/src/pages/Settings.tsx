@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getGoal, updateGoal, resetSystem } from "../lib/api";
+import { getGoal, updateGoal, resetSystem, getLatestStrategistPlan } from "../lib/api";
 import type { Goal, GoalProgress } from "../lib/types";
 
 export default function Settings() {
@@ -174,43 +174,125 @@ function GoalConfigPanel({
 // ── Safety Rails ────────────────────────────────────────────────────────
 
 function SafetyRailsPanel() {
-  const rails = [
-    { label: "Max Single Trade", value: "5%", description: "Max % of capital per trade" },
-    { label: "Max Market Allocation", value: "40%", description: "Max % in one market" },
-    { label: "Kill Switch Drawdown", value: "15%", description: "Auto-halt threshold" },
-    { label: "Max Daily Drawdown", value: "5%", description: "Daily loss limit" },
-    { label: "Mandatory Stop Loss", value: "Yes", description: "All trades require SL" },
-    { label: "Max Leverage", value: "3x", description: "Maximum position leverage" },
-    { label: "Max Daily Inference Cost", value: "$5.00", description: "Daily AI spending cap" },
-    { label: "Max Concurrent Positions", value: "20", description: "Position count limit" },
-    { label: "Max Losing Streak", value: "5", description: "Pause after N losses" },
-    { label: "Cool Down Period", value: "4h", description: "Wait after pause" },
-  ];
+  const { data: planData, isLoading } = useQuery({
+    queryKey: ["strategist-plan"],
+    queryFn: getLatestStrategistPlan,
+    refetchInterval: 30_000,
+  });
+
+  const plan = planData?.plan;
+  const configs = plan?.trader_configs as Record<string, unknown> | undefined;
+  const sr = configs?.safety_rails as Record<string, unknown> | undefined;
+  const riskPosture = (plan?.reasoning as string)?.match(/\[(aggressive|moderate|conservative|defensive)\]/)?.[1];
+
+  const rails = sr
+    ? [
+        { label: "Max Daily Drawdown", value: `${sr.max_daily_drawdown_pct}%`, description: "Pause trading if exceeded" },
+        { label: "Max Single Trade", value: `${sr.max_single_trade_pct}%`, description: "Max % of capital per trade" },
+        { label: "Kill Switch Drawdown", value: `${sr.kill_switch_drawdown_pct}%`, description: "Emergency stop threshold" },
+        { label: "Max Concurrent Positions", value: String(sr.max_concurrent_positions), description: "Position count limit" },
+        { label: "Max Daily AI Cost", value: `$${sr.max_daily_inference_cost_usd}`, description: "Daily inference budget" },
+        { label: "Max Leverage", value: `${sr.max_leverage}x`, description: "Maximum leverage" },
+        { label: "Mandatory Stop Loss", value: sr.mandatory_stop_loss ? "Yes" : "No", description: "All trades require SL" },
+        { label: "Max Stop Loss", value: `${sr.max_stop_loss_pct}%`, description: "Widest stop-loss allowed" },
+        { label: "Max Losing Streak", value: String(sr.max_losing_streak_before_pause), description: "Pause after N losses" },
+        { label: "Cool Down Period", value: `${sr.cool_down_hours_after_pause}h`, description: "Wait after pause" },
+      ]
+    : [];
+
+  // Per-trader directives
+  const traders = configs
+    ? (["crypto", "stocks", "polymarket"] as const).map((t) => {
+        const d = configs[t] as Record<string, unknown> | undefined;
+        return d ? { name: t, ...d } : null;
+      }).filter(Boolean)
+    : [];
 
   return (
     <div className="card">
-      <div className="card-header">Safety Rails</div>
-      <div className="space-y-2">
-        {rails.map((r) => (
-          <div
-            key={r.label}
-            className="flex items-center justify-between py-1.5 border-b border-terminal-border/50 last:border-0"
-          >
-            <div>
-              <span className="text-sm">{r.label}</span>
-              <span className="text-xs text-terminal-muted ml-2">
-                {r.description}
-              </span>
-            </div>
-            <span className="text-sm tabular-nums font-medium text-terminal-blue">
-              {r.value}
-            </span>
-          </div>
-        ))}
+      <div className="card-header flex items-center justify-between">
+        <span>Safety Rails</span>
+        {riskPosture && (
+          <span className={`badge ${
+            riskPosture === "aggressive" ? "badge-red" :
+            riskPosture === "conservative" ? "badge-green" :
+            riskPosture === "defensive" ? "badge-blue" : "badge-amber"
+          }`}>
+            {riskPosture}
+          </span>
+        )}
       </div>
-      <p className="text-xs text-terminal-muted mt-4">
-        Safety rails are configured in the system config file. Contact admin to modify.
-      </p>
+
+      {isLoading ? (
+        <div className="text-terminal-muted text-sm animate-pulse">Loading strategist plan...</div>
+      ) : !sr ? (
+        <div className="text-terminal-muted text-sm">
+          No strategist plan yet. Set a goal to generate safety rails.
+        </div>
+      ) : (
+        <>
+          <div className="space-y-2">
+            {rails.map((r) => (
+              <div
+                key={r.label}
+                className="flex items-center justify-between py-1.5 border-b border-terminal-border/50 last:border-0"
+              >
+                <div>
+                  <span className="text-sm">{r.label}</span>
+                  <span className="text-xs text-terminal-muted ml-2">{r.description}</span>
+                </div>
+                <span className="text-sm tabular-nums font-medium text-terminal-blue">
+                  {r.value}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {traders.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-terminal-border">
+              <div className="text-xs font-semibold uppercase tracking-wider text-terminal-muted mb-2">
+                Per-Trader Directives
+              </div>
+              <div className="space-y-3">
+                {traders.map((t) => {
+                  const d = t as Record<string, unknown>;
+                  return (
+                    <div key={d.name as string} className="bg-terminal-bg rounded-md p-3 border border-terminal-border/50">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-sm font-medium capitalize">{d.name as string}</span>
+                        <span className={`badge ${d.enabled ? "badge-green" : "badge-red"}`}>
+                          {d.enabled ? "Active" : "Disabled"}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1 text-xs">
+                        <span className="text-terminal-muted">Confidence:</span>
+                        <span className="tabular-nums">{d.confidence_threshold as number}%</span>
+                        <span className="text-terminal-muted">Max Position:</span>
+                        <span className="tabular-nums">{d.max_position_pct as number}%</span>
+                        {d.max_event_horizon_days != null && (
+                          <>
+                            <span className="text-terminal-muted">Event Horizon:</span>
+                            <span className="tabular-nums">{d.max_event_horizon_days as number}d</span>
+                          </>
+                        )}
+                      </div>
+                      {typeof d.strategy_notes === "string" && d.strategy_notes && (
+                        <p className="text-xs text-terminal-muted mt-2 italic">
+                          {d.strategy_notes.slice(0, 150)}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <p className="text-xs text-terminal-muted mt-4">
+            Safety rails are set by the AI Strategist based on your goal. Hard limits (25% max trade, 50% kill switch) cannot be exceeded.
+          </p>
+        </>
+      )}
     </div>
   );
 }
