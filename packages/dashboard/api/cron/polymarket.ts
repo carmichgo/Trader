@@ -370,6 +370,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // Fetch current open positions to avoid duplicates
+    const { data: openTrades } = await supabase
+      .from('trades')
+      .select('asset, direction, position_size_usd, entry_price')
+      .eq('status', 'open')
+      .eq('trader', 'polymarket');
+    const openPositions = openTrades ?? [];
+    const openAssets = new Set(openPositions.map((t: Record<string, unknown>) => `${t.asset}:${t.direction}`));
+
     // 1. Fetch Polymarket data and news in parallel
     const [markets, newsArticles] = await Promise.all([
       fetchPolymarkets(),
@@ -410,7 +419,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 - Max position size: ${directives.max_position_pct ?? 10}% of allocation per trade`
       : '';
 
-    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT + strategistContext;
+    const openPosContext = openPositions.length > 0
+      ? `\n\nCURRENT OPEN POSITIONS (DO NOT open duplicates):\n${openPositions.map((t: Record<string, unknown>) => `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price}`).join('\n')}`
+      : '';
+
+    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT + openPosContext + strategistContext;
 
     // 2. Screen with Sonnet
     const screenerResponse = await callClaude(
@@ -458,6 +471,12 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
         continue;
       }
       if (opp.score < analystThreshold) continue;
+
+      // DUPLICATE CHECK
+      if (openAssets.has(`${opp.asset}:${opp.direction}`)) {
+        result.errors.push(`Already have open ${opp.direction} in ${opp.asset}, skipping`);
+        continue;
+      }
 
       const market = markets.find(
         (m) => m.slug === opp.asset || m.question.toLowerCase().includes(opp.asset.toLowerCase())

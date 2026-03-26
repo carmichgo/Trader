@@ -632,6 +632,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // Fetch current open positions to avoid duplicates
+    const { data: openTrades } = await supabase
+      .from('trades')
+      .select('asset, direction, position_size_usd, entry_price')
+      .eq('status', 'open')
+      .eq('trader', TRADER_NAME);
+    const openPositions = openTrades ?? [];
+    const openAssets = new Set(openPositions.map(t => `${t.asset}:${t.direction}`));
+
     // 1. Fetch market data
     let markets: MarketData[];
     try {
@@ -642,7 +651,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const snapshot = buildMarketSnapshot(markets);
 
-    // 2. Build screener prompt with strategist directives
+    // 2. Build screener prompt with strategist directives + open positions
+    const openPosContext = openPositions.length > 0
+      ? `\n\nCURRENT OPEN POSITIONS (DO NOT open duplicate positions for assets you already hold):\n${openPositions.map(t => `- ${t.asset} ${t.direction} $${t.position_size_usd} @ $${t.entry_price}`).join('\n')}`
+      : '\n\nNo current open positions.';
+
     const strategistContext = directives
       ? `\n\nSTRATEGIST DIRECTIVES:
 - Risk posture: ${plan?.risk_posture ?? 'moderate'}
@@ -652,7 +665,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 - Daily P&L target: $${plan?.daily_target ?? 0}`
       : '';
 
-    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT_BASE + strategistContext;
+    const screenerSystemPrompt = SCREENER_SYSTEM_PROMPT_BASE + openPosContext + strategistContext;
 
     const screenerResponse = await callClaude(
       SONNET,
@@ -696,6 +709,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         continue;
       }
       if (opp.score < analystThreshold) continue;
+
+      // DUPLICATE CHECK: skip if we already have an open position in this asset+direction
+      if (openAssets.has(`${opp.asset}:${opp.direction}`)) {
+        result.errors.push(`Already have open ${opp.direction} position in ${opp.asset}, skipping`);
+        continue;
+      }
 
       const marketItem = markets.find((m) => m.symbol === opp.asset);
       const analystPrompt = `Trading opportunity:
