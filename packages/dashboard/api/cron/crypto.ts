@@ -142,23 +142,18 @@ const COIN_SYMBOLS: Record<string, string> = {
   binancecoin: 'BNB',
 };
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener AI for an autonomous paper trading system. Your job is to identify short-term trading opportunities based on the provided price data.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener for an autonomous AI trading system. You receive market data and strategist directives, and identify trading opportunities.
 
-IMPORTANT: This is paper trading — be proactive about finding setups. You should almost always find at least 1-2 opportunities from the data. Look for:
-- Momentum plays: assets with strong 24h moves that could continue
-- Mean reversion: assets that have dropped significantly and could bounce
-- Relative strength: assets outperforming or underperforming the group
-- Volatility plays: assets with unusual volume or price action
+Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly — they set your risk posture, focus assets, and strategy approach.
 
-Respond ONLY with a JSON array of opportunities. Each object must have:
-- asset: string (ticker symbol like "BTC", "ETH", etc.)
-- direction: "buy" or "sell"
-- score: number 0-100 (confidence/opportunity score)
-- estimated_edge_pct: number (estimated edge percentage, e.g. 1.5 means 1.5%)
-- win_probability: number 0-1 (e.g. 0.65)
-- rationale: string (1-2 sentences explaining the setup)
+OUTPUT FORMAT — respond ONLY with a JSON array:
+[{"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"..."}]
 
-Return at least 1 opportunity if any asset shows noteworthy price action. Only return [] if ALL assets are completely flat with no signal.`;
+Rules:
+- score 0-100 reflects your confidence in the opportunity
+- Always find at least 1-2 opportunities unless the market is completely dead
+- Look for: momentum, mean reversion, relative strength, volatility
+- Follow the strategist's focus_assets and strategy_notes closely`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior crypto trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 
@@ -370,7 +365,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const screenerResponse = await callClaude(
       SONNET,
       screenerSystemPrompt,
-      `Analyze this market data and identify trading opportunities. Be very selective — only flag strong setups.\n\n${snapshot}`,
+      `Analyze this crypto market data and find trading opportunities:\n\n${snapshot}`,
       1024
     );
 

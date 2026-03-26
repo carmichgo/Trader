@@ -197,7 +197,12 @@ KEY PRINCIPLES:
    - Polymarket: CRITICAL — only trade events that will RESOLVE within the goal's remaining time horizon. If you have 30 days left, do NOT bet on events resolving in 6 months.
 5. For Polymarket specifically: set max_event_horizon_days to roughly match the goal's remaining days. This prevents capital from being locked in long-dated bets that cannot contribute to the goal.
 
-6. SAFETY RAILS: You must set risk limits appropriate to the goal. Conservative goals get tight rails, aggressive goals get looser rails (but never exceeding hard limits).
+6. STRATEGY NOTES ARE CRITICAL: Your strategy_notes for each trader are injected DIRECTLY into the screener's AI prompt. The screener will follow them literally. Be specific and actionable. Examples:
+   - BAD: "Focus on crypto" (too vague)
+   - GOOD: "BTC showing bullish momentum, look for pullback entries near $68K. ETH lagging — potential catch-up play. SOL risky but high-beta for aggressive targets. Prefer long positions in this regime."
+   - GOOD: "Focus on political events resolving before April 15. US election markets have highest edge. Sell overpriced meme markets."
+
+7. SAFETY RAILS: You must set risk limits appropriate to the goal. Conservative goals get tight rails, aggressive goals get looser rails (but never exceeding hard limits).
    - Hard limits you CANNOT exceed: max 25% per trade, max 60% per market, max 50% total drawdown, max 15% daily drawdown, max 5x leverage, max $25/day AI cost
    - Within those hard limits, YOU decide the appropriate soft limits based on the goal
 

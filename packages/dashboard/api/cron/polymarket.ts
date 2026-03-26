@@ -139,18 +139,19 @@ const SONNET = 'claude-sonnet-4-6';
 const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'polymarket';
 
-const SCREENER_SYSTEM_PROMPT = `You are a prediction markets screener AI specializing in Polymarket.
-Analyze the provided markets and identify mispriced events where the crowd probability seems wrong.
+const SCREENER_SYSTEM_PROMPT = `You are a Polymarket prediction market screener for an autonomous AI trading system. You identify mispriced events where the crowd probability is wrong.
 
-Respond ONLY with a JSON array. Each object must have:
-- asset: string (market slug or short identifier)
-- direction: "buy" | "sell" (buy = bet YES, sell = bet NO)
-- score: number 0-100 (confidence in mispricing)
-- estimated_edge_pct: number (estimated edge over market price)
-- win_probability: number 0-1 (your estimated true probability)
-- rationale: string (why you think the market is mispriced)
+Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly — they set which event categories to focus on and the time horizon for trades.
 
-If no opportunities exist, return an empty array [].`;
+OUTPUT FORMAT — respond ONLY with a JSON array:
+[{"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."}]
+
+Rules:
+- direction "buy" = bet YES, "sell" = bet NO
+- Focus on events the strategist says to focus on
+- Respect max_event_horizon_days — skip events resolving after that
+- Look for: probability mispricing, information asymmetry, crowd overreaction, correlated events
+- Always find at least 1-2 opportunities from the provided markets`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior prediction markets analyst AI. You receive a Polymarket opportunity and must decide whether to take the trade.
 

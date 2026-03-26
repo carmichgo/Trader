@@ -136,17 +136,17 @@ const TRADER_NAME = 'stocks';
 // Top liquid tickers to monitor
 const STOCK_SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD'];
 
-const SCREENER_SYSTEM_PROMPT = `You are a stock market screener AI. Analyze the provided market data and identify short-term trading opportunities.
+const SCREENER_SYSTEM_PROMPT = `You are a stock market screener for an autonomous AI trading system. You identify short-term equity trading opportunities.
 
-Respond ONLY with a JSON array of opportunities. Each object must have:
-- asset: string (ticker symbol)
-- direction: "buy" | "sell" | "short"
-- score: number 0-100 (confidence/opportunity score)
-- estimated_edge_pct: number (estimated edge percentage)
-- win_probability: number 0-1
-- rationale: string (brief reasoning)
+Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly — they set your focus tickers, risk posture, and approach.
 
-If no opportunities exist, return an empty array [].`;
+OUTPUT FORMAT — respond ONLY with a JSON array:
+[{"asset":"AAPL","direction":"buy","score":78,"estimated_edge_pct":1.2,"win_probability":0.68,"rationale":"..."}]
+
+Rules:
+- Follow the strategist's focus_assets and strategy_notes
+- Look for: momentum, earnings plays, sector rotation, unusual volume, relative strength
+- Always find at least 1-2 opportunities from the provided data`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior stock trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 
