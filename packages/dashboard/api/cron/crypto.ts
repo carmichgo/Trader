@@ -563,13 +563,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Filter for high confidence using strategist threshold
-    const minScore = directives?.confidence_threshold ?? 70;
-    const viable = opportunities.filter((o) => o.score >= minScore);
+    // All screener results are viable — the screener already filters by threshold in its prompt
+    const viable = opportunities.filter((o) => o.score >= 40); // basic sanity floor
     result.opportunities_found = viable.length;
 
-    // 3. Only deep-analyze high-scoring opportunities (saves cost)
-    // Use strategist's threshold if available, otherwise default
+    // Analyst threshold from strategist (default 60)
     const analystThreshold = directives?.confidence_threshold ?? ANALYST_THRESHOLD_DEFAULT;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
