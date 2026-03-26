@@ -238,7 +238,7 @@ async function fetchPolymarkets(): Promise<PolymarketMarket[]> {
   return unique.slice(0, 30);
 }
 
-function buildMarketSnapshot(markets: PolymarketMarket[]): string {
+function buildMarketSnapshot(markets: PolymarketMarket[], news?: NewsArticle[]): string {
   const timestamp = new Date().toISOString();
   let snapshot = `Polymarket Active Markets Snapshot (${timestamp})\n\n`;
 
@@ -259,6 +259,16 @@ function buildMarketSnapshot(markets: PolymarketMarket[]): string {
     if (m.endDate) snapshot += `  End Date: ${m.endDate}\n`;
     snapshot += '\n';
   }
+
+  // Latest news headlines for spotting news-driven mispricing
+  if (news && news.length > 0) {
+    snapshot += `LATEST NEWS HEADLINES:\n`;
+    for (const article of news) {
+      snapshot += `- [${article.source?.name ?? 'Unknown'}] ${article.title}\n`;
+    }
+    snapshot += '\n';
+  }
+
   return snapshot;
 }
 
@@ -360,8 +370,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // 1. Fetch Polymarket data
-    const markets = await fetchPolymarkets();
+    // 1. Fetch Polymarket data and news in parallel
+    const [markets, newsArticles] = await Promise.all([
+      fetchPolymarkets(),
+      fetchNews(),
+    ]);
     if (markets.length === 0) {
       result.errors.push('No markets returned from Polymarket API');
       return res.status(200).json(result);
@@ -383,7 +396,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    const snapshot = buildMarketSnapshot(filteredMarkets);
+    const snapshot = buildMarketSnapshot(filteredMarkets, newsArticles);
 
     // 2. Build screener prompt with strategist directives
     const strategistContext = directives
