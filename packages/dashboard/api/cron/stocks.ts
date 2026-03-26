@@ -139,17 +139,26 @@ const TRADER_NAME = 'stocks';
 // Top liquid tickers to monitor
 const STOCK_SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD'];
 
-const SCREENER_SYSTEM_PROMPT = `You are a stock market screener for an autonomous AI trading system. You identify short-term equity trading opportunities.
+const SCREENER_SYSTEM_PROMPT = `You are a stock market screener for an autonomous AI trading system.
 
-Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly — they set your focus tickers, risk posture, and approach.
+You have TWO jobs:
+1. FIND new equity trading opportunities (direction: "buy" or "sell")
+2. RECOMMEND closing existing positions if conditions changed (direction: "close")
+
+Your behavior is driven by the STRATEGIST DIRECTIVES below.
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
-[{"asset":"AAPL","direction":"buy","score":78,"estimated_edge_pct":1.2,"win_probability":0.68,"rationale":"..."}]
+[
+  {"asset":"NVDA","direction":"buy","score":78,"estimated_edge_pct":1.2,"win_probability":0.68,"rationale":"..."},
+  {"asset":"TSLA","direction":"close","score":80,"estimated_edge_pct":0,"win_probability":0,"rationale":"Thesis invalidated, close long"}
+]
 
 Rules:
+- "buy"/"sell" = open NEW position, "close" = close EXISTING position
+- Only use "close" for assets listed in CURRENT OPEN POSITIONS
+- For close decisions: has the thesis changed? Better to take profit or cut loss?
 - Follow the strategist's focus_assets and strategy_notes
-- Look for: momentum, earnings plays, sector rotation, unusual volume, relative strength
-- Always find at least 1-2 opportunities from the provided data`;
+- Always review open positions and recommend closing any that no longer make sense`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior stock trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 
@@ -576,15 +585,46 @@ Analyze this stock market data and identify trading opportunities:\n\n${snapshot
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Filter for high confidence using strategist threshold
-    const minScore = directives?.confidence_threshold ?? 70;
-    const viable = opportunities.filter((o) => o.score >= minScore);
+    // Separate close recommendations from new opportunities
+    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 50);
+    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
+
+    // Process close recommendations
+    for (const rec of closeRecs) {
+      const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
+      if (!matchingTrade) continue;
+
+      const marketItem = markets.find(m => m.symbol === rec.asset);
+      const currentPrice = marketItem?.price ?? 0;
+      const entryPrice = Number(matchingTrade.entry_price) || 0;
+      const posSize = Number(matchingTrade.position_size_usd) || 0;
+      const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
+
+      const { error: closeErr } = await supabase
+        .from('trades')
+        .update({
+          status: 'closed',
+          close_reason: 'signal_reversal',
+          exit_price: currentPrice,
+          gross_pnl: pnl,
+          net_pnl: pnl - (Number(matchingTrade.total_cost) || 0),
+          closed_at: new Date().toISOString(),
+        })
+        .eq('asset', rec.asset)
+        .eq('trader', 'stocks')
+        .eq('status', 'open')
+        .limit(1);
+
+      if (!closeErr) {
+        result.errors.push(`AI closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
+      }
+    }
+
+    const viable = newOpps;
     result.opportunities_found = viable.length;
 
     // 3. Deep-analyze high-scoring opportunities
-    const analystThreshold = directives?.confidence_threshold
-      ? directives.confidence_threshold
-      : 60;
+    const analystThreshold = directives?.confidence_threshold ?? 60;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded

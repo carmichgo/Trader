@@ -150,17 +150,26 @@ const COIN_SYMBOLS: Record<string, string> = {
   'injective-protocol': 'INJ', sui: 'SUI', aptos: 'APT', celestia: 'TIA',
 };
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener for an autonomous AI trading system. You receive market data and strategist directives, and identify trading opportunities.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are a crypto market screener for an autonomous AI trading system. You receive market data, open positions, and strategist directives.
 
-Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly — they set your risk posture, focus assets, and strategy approach.
+You have TWO jobs:
+1. FIND new trading opportunities (direction: "buy" or "sell")
+2. RECOMMEND closing existing positions if conditions have changed (direction: "close")
+
+Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly.
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
-[{"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"..."}]
+[
+  {"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"Momentum breakout..."},
+  {"asset":"SOL","direction":"close","score":82,"estimated_edge_pct":0,"win_probability":0,"rationale":"Momentum fading, close existing long to lock in gains"}
+]
 
 Rules:
-- score 0-100 reflects your confidence in the opportunity
-- Always find at least 1-2 opportunities unless the market is completely dead
-- Look for: momentum, mean reversion, relative strength, volatility
+- direction "buy" or "sell" = open a NEW position
+- direction "close" = close an EXISTING open position (only use for assets listed in CURRENT OPEN POSITIONS)
+- score 0-100 reflects your confidence
+- For close recommendations: consider whether the original thesis still holds, if stop-loss is about to be hit, or if better opportunities exist
+- Always review open positions and recommend closing any that no longer make sense
 - Follow the strategist's focus_assets and strategy_notes closely`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior crypto trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
@@ -694,8 +703,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // All screener results are viable — the screener already filters by threshold in its prompt
-    const viable = opportunities.filter((o) => o.score >= 40); // basic sanity floor
+    // Separate close recommendations from new trade opportunities
+    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 50);
+    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
+
+    // Process close recommendations first
+    for (const rec of closeRecs) {
+      // Find the matching open trade
+      const matchingTrade = openPositions.find(t => t.asset === rec.asset);
+      if (!matchingTrade) continue;
+
+      // Get current price for P&L calculation
+      const marketItem = markets.find(m => m.symbol === rec.asset);
+      const currentPrice = marketItem?.price ?? 0;
+      const entryPrice = Number(matchingTrade.entry_price) || 0;
+      const posSize = Number(matchingTrade.position_size_usd) || 0;
+      const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
+
+      const { error: closeErr } = await supabase
+        .from('trades')
+        .update({
+          status: 'closed',
+          close_reason: 'signal_reversal',
+          exit_price: currentPrice,
+          gross_pnl: pnl,
+          net_pnl: pnl - (Number(matchingTrade.total_cost) || 0),
+          closed_at: new Date().toISOString(),
+        })
+        .eq('asset', rec.asset)
+        .eq('trader', TRADER_NAME)
+        .eq('status', 'open')
+        .limit(1);
+
+      if (!closeErr) {
+        result.errors.push(`AI closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
+      }
+    }
+
+    const viable = newOpps;
     result.opportunities_found = viable.length;
 
     // Analyst threshold from strategist (default 60)

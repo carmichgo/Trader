@@ -160,19 +160,27 @@ const SONNET = 'claude-sonnet-4-6';
 const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'polymarket';
 
-const SCREENER_SYSTEM_PROMPT = `You are a Polymarket prediction market screener for an autonomous AI trading system. You identify mispriced events where the crowd probability is wrong.
+const SCREENER_SYSTEM_PROMPT = `You are a Polymarket prediction market screener for an autonomous AI trading system.
 
-Your behavior is driven by the STRATEGIST DIRECTIVES below. Follow them exactly — they set which event categories to focus on and the time horizon for trades.
+You have TWO jobs:
+1. FIND mispriced events to open new positions (direction: "buy" or "sell")
+2. RECOMMEND closing existing positions if conditions changed (direction: "close")
+
+Your behavior is driven by the STRATEGIST DIRECTIVES below.
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
-[{"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."}]
+[
+  {"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."},
+  {"asset":"existing-market","direction":"close","score":85,"estimated_edge_pct":0,"win_probability":0,"rationale":"News changed the odds, close to lock in profit"}
+]
 
 Rules:
-- direction "buy" = bet YES, "sell" = bet NO
-- Focus on events the strategist says to focus on
+- "buy" = bet YES, "sell" = bet NO, "close" = close an EXISTING position
+- Only use "close" for assets listed in CURRENT OPEN POSITIONS
+- For close decisions: has news changed the odds? Is the event about to resolve? Has the market moved in our favor enough to take profit?
 - Respect max_event_horizon_days — skip events resolving after that
-- Look for: probability mispricing, information asymmetry, crowd overreaction, correlated events
-- Always find at least 1-2 opportunities from the provided markets`;
+- Look for: probability mispricing, information asymmetry, crowd overreaction
+- Always review open positions and recommend closing any that no longer make sense`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior prediction markets analyst AI. You receive a Polymarket opportunity and must decide whether to take the trade.
 
@@ -453,15 +461,37 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Filter for high confidence using strategist threshold
-    const minScore = directives?.confidence_threshold ?? 70;
-    const viable = opportunities.filter((o) => o.score >= minScore);
+    // Separate close recommendations from new opportunities
+    const closeRecs = opportunities.filter((o) => o.direction === 'close' && o.score >= 50);
+    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 40);
+
+    // Process close recommendations
+    for (const rec of closeRecs) {
+      const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
+      if (!matchingTrade) continue;
+
+      const { error: closeErr } = await supabase
+        .from('trades')
+        .update({
+          status: 'closed',
+          close_reason: 'signal_reversal',
+          closed_at: new Date().toISOString(),
+        })
+        .eq('asset', rec.asset)
+        .eq('trader', 'polymarket')
+        .eq('status', 'open')
+        .limit(1);
+
+      if (!closeErr) {
+        result.errors.push(`AI closed ${rec.asset}: ${rec.rationale}`);
+      }
+    }
+
+    const viable = newOpps;
     result.opportunities_found = viable.length;
 
     // 3. Deep-analyze high-scoring opportunities
-    const analystThreshold = directives?.confidence_threshold
-      ? directives.confidence_threshold
-      : 60;
+    const analystThreshold = directives?.confidence_threshold ?? 60;
     const updatedDailyCost = dailyCost + screenerResponse.cost_usd;
     for (const opp of viable) {
       // Skip analyst if cost cap would be exceeded
