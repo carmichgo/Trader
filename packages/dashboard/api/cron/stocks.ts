@@ -695,54 +695,87 @@ Analyze this stock market data and identify trading opportunities:\n\n${snapshot
     let opportunities: ScreenerOpportunity[] = [];
     try {
       opportunities = extractJSON<ScreenerOpportunity[]>(screenerResponse.content);
+      // Screener should only return buy/sell, filter out any close recommendations
+      opportunities = opportunities.filter((o) => o.direction !== 'close');
     } catch {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Separate close recommendations from new opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close');
-    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 30);
+    // POSITION REVIEW: Separate AI call with dedicated prompt (only if we have open positions)
+    if (openPositions.length > 0) {
+      try {
+        const reviewResponse = await callClaude(
+          SONNET,
+          POSITION_REVIEW_PROMPT + '\n' + fullContext,
+          `Review these open positions against current market data. Only recommend closing if thesis is BROKEN.\n\nMARKET DATA:\n${snapshot}`,
+          512
+        );
 
-    // Process close recommendations — AI has full context and makes all decisions
-    for (const rec of closeRecs) {
-      const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
-      if (!matchingTrade) continue;
+        await supabase.from('ai_decisions').insert({
+          decision_type: 'analyst',
+          trader: TRADER_NAME,
+          model: SONNET,
+          prompt_tokens: reviewResponse.input_tokens,
+          completion_tokens: reviewResponse.output_tokens,
+          cost_usd: reviewResponse.cost_usd,
+          latency_ms: reviewResponse.latency_ms,
+          input_summary: { type: 'position_review', open_positions: openPositions.length },
+          output_raw: reviewResponse.content,
+        });
+        result.decisions_logged++;
 
-      const marketItem = markets.find(m => m.symbol === rec.asset);
-      const currentPrice = marketItem?.price ?? 0;
-      const entryPrice = Number(matchingTrade.entry_price) || 0;
-      const posSize = Number(matchingTrade.position_size_usd) || 0;
-      const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
-
-      const { error: closeErr } = await supabase
-        .from('trades')
-        .update({
-          status: 'closed',
-          close_reason: 'signal_reversal',
-          exit_price: currentPrice,
-          gross_pnl: pnl,
-          net_pnl: pnl - (Number(matchingTrade.total_cost) || 0),
-          closed_at: new Date().toISOString(),
-        })
-        .eq('asset', rec.asset)
-        .eq('trader', 'stocks')
-        .eq('status', 'open')
-        .limit(1);
-
-      if (!closeErr) {
-        result.errors.push(`AI closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
-        // Close on Alpaca
+        let closeRecs: ScreenerOpportunity[] = [];
         try {
-          await closeAlpacaPosition(rec.asset);
-          result.errors.push(`Alpaca position closed: ${rec.asset}`);
-        } catch (err) {
-          // Position might not exist on Alpaca (paper trades from before)
-          result.errors.push(`Alpaca close skipped for ${rec.asset}: ${String(err)}`);
+          closeRecs = extractJSON<ScreenerOpportunity[]>(reviewResponse.content);
+          closeRecs = closeRecs.filter((o) => o.direction === 'close');
+        } catch {
+          // Empty array = hold all positions (correct default)
         }
+
+        for (const rec of closeRecs) {
+          const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
+          if (!matchingTrade) continue;
+
+          const marketItem = markets.find(m => m.symbol === rec.asset);
+          const currentPrice = marketItem?.price ?? 0;
+          const entryPrice = Number(matchingTrade.entry_price) || 0;
+          const posSize = Number(matchingTrade.position_size_usd) || 0;
+          const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
+          const totalCost = Number(matchingTrade.total_cost) || 0;
+
+          const { error: closeErr } = await supabase
+            .from('trades')
+            .update({
+              status: 'closed',
+              close_reason: 'signal_reversal',
+              exit_price: currentPrice,
+              gross_pnl: pnl,
+              net_pnl: pnl - totalCost,
+              closed_at: new Date().toISOString(),
+            })
+            .eq('asset', rec.asset)
+            .eq('trader', 'stocks')
+            .eq('status', 'open')
+            .limit(1);
+
+          if (!closeErr) {
+            result.errors.push(`Position manager closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
+            // Close on Alpaca
+            try {
+              await closeAlpacaPosition(rec.asset);
+              result.errors.push(`Alpaca position closed: ${rec.asset}`);
+            } catch (err) {
+              // Position might not exist on Alpaca (paper trades from before)
+              result.errors.push(`Alpaca close skipped for ${rec.asset}: ${String(err)}`);
+            }
+          }
+        }
+      } catch (err) {
+        result.errors.push(`Position review failed: ${String(err)}`);
       }
     }
 
-    const viable = newOpps;
+    const viable = opportunities.filter((o) => o.score >= 30);
     result.opportunities_found = viable.length;
 
     // 3. Deep-analyze high-scoring opportunities
