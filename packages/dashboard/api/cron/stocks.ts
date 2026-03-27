@@ -189,32 +189,51 @@ const TRADER_NAME = 'stocks';
 // Top liquid tickers to monitor
 const STOCK_SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD'];
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are the stock trading AI for a goal-driven autonomous system. You receive complete market data, portfolio context, macro indicators, and strategist directives.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are the stock OPPORTUNITY SCREENER for a goal-driven autonomous trading system.
 
-You make TWO types of decisions:
-1. OPEN new positions — when you see a genuine opportunity with clear edge
-2. CLOSE existing positions — ONLY when the original thesis is invalidated
+YOUR ONLY JOB: Find NEW stock trading opportunities. Scan the market data and identify assets worth buying or shorting.
+
+DO NOT recommend closing existing positions. Position management is handled separately. You are ONLY looking for new entries.
+
+CONTEXT: You receive the goal, current open positions (for awareness — don't duplicate), and strategist directives.
 
 DECISION PRINCIPLES:
 - Every trade must serve THE GOAL. Know the target, timeline, and current progress.
-- Opening: look for momentum, sector rotation, earnings catalysts, macro alignment, relative strength
-- Closing: ONLY close if the thesis is BROKEN (not just drawdown). Normal market fluctuation is expected.
-  Ask yourself: "Has something fundamentally changed since we entered?" If no, hold.
+- Look for: momentum, sector rotation, earnings catalysts, macro alignment, relative strength
 - Position sizing: consider current capital, number of open positions, and the strategist's max_position_pct
 - Learn from recent closed trades — don't repeat mistakes
-- Every close costs fees + slippage in real trading. Closing at breakeven is a net loss.
 - Consider macro context: Fed rates, yield curve, VIX for overall risk environment
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
-[
-  {"asset":"NVDA","direction":"buy","score":78,"estimated_edge_pct":1.2,"win_probability":0.68,"rationale":"..."},
-  {"asset":"TSLA","direction":"close","score":80,"estimated_edge_pct":0,"win_probability":0,"rationale":"Thesis broken because..."}
-]
+[{"asset":"NVDA","direction":"buy","score":78,"estimated_edge_pct":1.2,"win_probability":0.68,"rationale":"Momentum breakout above resistance..."}]
 
-- direction: "buy", "sell" (new position), or "close" (exit existing position)
-- For "close": explain specifically what changed since the position was opened
-- Score: your confidence 0-100
-- If no action needed, return []`;
+Rules:
+- direction: "buy" or "sell" (short) ONLY. Never "close".
+- score 0-100 = your confidence
+- Don't open positions in assets you already hold (check CURRENT OPEN POSITIONS)
+- If nothing looks good, return [] — don't force trades
+- Follow the strategist's focus_assets and strategy_notes`;
+
+const POSITION_REVIEW_PROMPT = `You are the stock POSITION MANAGER for a goal-driven autonomous trading system.
+
+YOUR ONLY JOB: Review existing open positions and decide if any should be closed.
+
+DECISION FRAMEWORK — only close a position if ONE of these is true:
+1. THESIS BROKEN: A specific piece of news or event has fundamentally changed the outlook (cite the news)
+2. STOP-LOSS HIT: Price has moved beyond the position's stop-loss level
+3. TARGET REACHED: Price has hit or exceeded the take-profit target
+4. CAPITAL REALLOCATION: The strategist needs this capital for a higher-priority opportunity (cite which one)
+
+DO NOT close positions just because:
+- The market dipped 1-3% (that's normal volatility)
+- Macro sentiment is negative (contrarian = hold)
+- The position is at breakeven (closing costs fees/slippage = guaranteed loss)
+- You're uncertain — uncertainty is not a reason to close
+
+OUTPUT FORMAT — respond ONLY with a JSON array:
+[{"asset":"TSLA","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"THESIS BROKEN: [specific news/event that changed the outlook]"}]
+
+If ALL positions should be HELD, return []. This is the CORRECT default — holding is usually right.`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior stock trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 

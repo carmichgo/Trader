@@ -203,31 +203,44 @@ const COIN_SYMBOLS: Record<string, string> = {
   'injective-protocol': 'INJ', sui: 'SUI', aptos: 'APT', celestia: 'TIA',
 };
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are the crypto trading AI for a goal-driven autonomous system. You receive complete market data, portfolio context, and strategist directives.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are the crypto OPPORTUNITY SCREENER for a goal-driven autonomous trading system.
 
-You make TWO types of decisions:
-1. OPEN new positions — when you see a genuine opportunity with clear edge
-2. CLOSE existing positions — ONLY when the original thesis is invalidated
+YOUR ONLY JOB: Find NEW trading opportunities. Scan the market data and identify assets worth buying or shorting.
 
-DECISION PRINCIPLES:
-- Every trade must serve THE GOAL. Know the target, timeline, and current progress.
-- Opening: look for momentum, mean reversion, relative strength, funding rate signals, news catalysts
-- Closing: ONLY close if the thesis is BROKEN (not just drawdown). Small losses are normal in crypto.
-  Ask yourself: "Has something fundamentally changed since we entered?" If no, hold.
-- Position sizing: consider current capital, number of open positions, and the strategist's max_position_pct
-- Learn from recent closed trades — don't repeat mistakes
-- Every close costs fees + slippage in real trading. Closing at breakeven is a net loss.
+DO NOT recommend closing existing positions. Position management is handled separately. You are ONLY looking for new entries.
+
+CONTEXT: You receive the goal, current open positions (for awareness — don't duplicate), and strategist directives.
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
-[
-  {"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"..."},
-  {"asset":"SOL","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"Thesis broken because..."}
-]
+[{"asset":"BTC","direction":"buy","score":75,"estimated_edge_pct":1.5,"win_probability":0.65,"rationale":"Momentum breakout above resistance..."}]
 
-- direction: "buy", "sell" (new position), or "close" (exit existing position)
-- For "close": explain specifically what changed since the position was opened
-- Score: your confidence 0-100
-- If no action needed, return []`;
+Rules:
+- direction: "buy" or "sell" (short) ONLY. Never "close".
+- score 0-100 = your confidence
+- Don't open positions in assets you already hold (check CURRENT OPEN POSITIONS)
+- If nothing looks good, return [] — don't force trades
+- Follow the strategist's focus_assets and strategy_notes`;
+
+const POSITION_REVIEW_PROMPT = `You are the crypto POSITION MANAGER for a goal-driven autonomous trading system.
+
+YOUR ONLY JOB: Review existing open positions and decide if any should be closed.
+
+DECISION FRAMEWORK — only close a position if ONE of these is true:
+1. THESIS BROKEN: A specific piece of news or event has fundamentally changed the outlook (cite the news)
+2. STOP-LOSS HIT: Price has moved beyond the position's stop-loss level
+3. TARGET REACHED: Price has hit or exceeded the take-profit target
+4. CAPITAL REALLOCATION: The strategist needs this capital for a higher-priority opportunity (cite which one)
+
+DO NOT close positions just because:
+- The market dipped 1-3% (that's normal volatility)
+- "Fear and greed" sentiment is negative (contrarian = hold)
+- The position is breakeven (closing costs fees/slippage = guaranteed loss)
+- You're uncertain — uncertainty is not a reason to close
+
+OUTPUT FORMAT — respond ONLY with a JSON array:
+[{"asset":"SOL","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"THESIS BROKEN: [specific news/event that changed the outlook]"}]
+
+If ALL positions should be HELD, return []. This is the CORRECT default — holding is usually right.`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior crypto trading analyst AI. You receive a trading opportunity and must decide whether to take the trade.
 
@@ -793,57 +806,84 @@ ${(recentClosedTrades ?? []).length > 0 ? (recentClosedTrades ?? []).map((t: Rec
     let opportunities: ScreenerOpportunity[] = [];
     try {
       opportunities = extractJSON<ScreenerOpportunity[]>(screenerResponse.content);
+      // Screener should only return buy/sell, filter out any close recommendations
+      opportunities = opportunities.filter((o) => o.direction !== 'close');
     } catch {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Separate close recommendations from new trade opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close');
-    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 30);
+    // POSITION REVIEW: Separate AI call with dedicated prompt (only if we have open positions)
+    if (openPositions.length > 0) {
+      try {
+        const reviewResponse = await callClaude(
+          SONNET,
+          POSITION_REVIEW_PROMPT + '\n' + fullContext,
+          `Review these open positions against current market data. Only recommend closing if thesis is BROKEN.\n\nMARKET DATA:\n${snapshot}`,
+          512
+        );
 
-    // Process close recommendations — AI has full context and makes all decisions
-    for (const rec of closeRecs) {
-      // Find the matching open trade
-      const matchingTrade = openPositions.find(t => t.asset === rec.asset);
-      if (!matchingTrade) continue;
+        await supabase.from('ai_decisions').insert({
+          decision_type: 'analyst',
+          trader: TRADER_NAME,
+          model: SONNET,
+          prompt_tokens: reviewResponse.input_tokens,
+          completion_tokens: reviewResponse.output_tokens,
+          cost_usd: reviewResponse.cost_usd,
+          latency_ms: reviewResponse.latency_ms,
+          input_summary: { type: 'position_review', open_positions: openPositions.length },
+          output_raw: reviewResponse.content,
+        });
+        result.decisions_logged++;
 
-      // Calculate P&L for record keeping
-      const marketItem = markets.find(m => m.symbol === rec.asset);
-      const currentPrice = marketItem?.price ?? 0;
-      const entryPrice = Number(matchingTrade.entry_price) || 0;
-      const posSize = Number(matchingTrade.position_size_usd) || 0;
-      const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
-      const totalCost = Number(matchingTrade.total_cost) || 0;
-
-      const { error: closeErr } = await supabase
-        .from('trades')
-        .update({
-          status: 'closed',
-          close_reason: 'signal_reversal',
-          exit_price: currentPrice,
-          gross_pnl: pnl,
-          net_pnl: pnl - totalCost,
-          closed_at: new Date().toISOString(),
-        })
-        .eq('asset', rec.asset)
-        .eq('trader', TRADER_NAME)
-        .eq('status', 'open')
-        .limit(1);
-
-      if (!closeErr) {
-        result.errors.push(`AI closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
-        // Close on Alpaca
+        let closeRecs: ScreenerOpportunity[] = [];
         try {
-          await closeAlpacaPosition(rec.asset);
-          result.errors.push(`Alpaca position closed: ${rec.asset}`);
-        } catch (err) {
-          // Position might not exist on Alpaca (paper trades from before)
-          result.errors.push(`Alpaca close skipped for ${rec.asset}: ${String(err)}`);
+          closeRecs = extractJSON<ScreenerOpportunity[]>(reviewResponse.content);
+          closeRecs = closeRecs.filter((o) => o.direction === 'close');
+        } catch {
+          // Empty array = hold all positions (correct default)
         }
+
+        for (const rec of closeRecs) {
+          const matchingTrade = openPositions.find(t => t.asset === rec.asset);
+          if (!matchingTrade) continue;
+
+          const marketItem = markets.find(m => m.symbol === rec.asset);
+          const currentPrice = marketItem?.price ?? 0;
+          const entryPrice = Number(matchingTrade.entry_price) || 0;
+          const posSize = Number(matchingTrade.position_size_usd) || 0;
+          const pnl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * posSize : 0;
+          const totalCost = Number(matchingTrade.total_cost) || 0;
+
+          const { error: closeErr } = await supabase
+            .from('trades')
+            .update({
+              status: 'closed',
+              close_reason: 'signal_reversal',
+              exit_price: currentPrice,
+              gross_pnl: pnl,
+              net_pnl: pnl - totalCost,
+              closed_at: new Date().toISOString(),
+            })
+            .eq('asset', rec.asset)
+            .eq('trader', TRADER_NAME)
+            .eq('status', 'open')
+            .limit(1);
+
+          if (!closeErr) {
+            result.errors.push(`Position manager closed ${rec.asset}: ${rec.rationale} (P&L: $${pnl.toFixed(2)})`);
+            try {
+              await closeAlpacaPosition(rec.asset);
+            } catch {
+              // Position might not exist on Alpaca
+            }
+          }
+        }
+      } catch (err) {
+        result.errors.push(`Position review failed: ${String(err)}`);
       }
     }
 
-    const viable = newOpps;
+    const viable = opportunities.filter((o) => o.score >= 30);
     result.opportunities_found = viable.length;
 
     // Analyst threshold from strategist

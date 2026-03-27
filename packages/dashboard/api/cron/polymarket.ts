@@ -166,27 +166,18 @@ const SONNET = 'claude-sonnet-4-6';
 const OPUS = 'claude-opus-4-6';
 const TRADER_NAME = 'polymarket';
 
-const SCREENER_SYSTEM_PROMPT_BASE = `You are the Polymarket prediction market AI for a goal-driven autonomous trading system.
+const SCREENER_SYSTEM_PROMPT_BASE = `You are the Polymarket OPPORTUNITY SCREENER for a goal-driven autonomous trading system.
+
+YOUR ONLY JOB: Find NEW mispriced prediction markets. Scan the market data and identify events worth betting on.
+
+DO NOT recommend closing existing positions. Position management is handled separately. You are ONLY looking for new entries.
 
 CRITICAL — HOW POLYMARKET WORKS:
 - Markets resolve to 0¢ (NO) or 100¢ (YES) at their end date
 - "buy" = bet YES (you profit if event happens)
 - "sell" = bet NO (you profit if event does NOT happen)
-- A "sell" position at entry 99¢ means: we bet NO at 99¢. If the event doesn't happen (likely), we collect ~1¢ per share. This is a LOW-RISK bet that profits by waiting for resolution.
-- A "sell" position at entry 45¢ means: we bet NO at 45¢. We profit 45¢ per share if the event doesn't happen.
 
-CLOSING POLYMARKET POSITIONS:
-- DO NOT close positions just because you're confused about the entry price
-- "sell" positions PROFIT when the event DOESN'T happen — which means HOLD them until the resolution date
-- Only close a position if:
-  1. Breaking news makes the event MUCH more likely to happen (invalidating a NO bet)
-  2. Breaking news makes the event MUCH less likely (invalidating a YES bet)
-  3. The position can be sold at a profit NOW and the capital is needed elsewhere
-- If an event resolves in 5 days and our thesis hasn't changed, HOLD. That's 5 days from collecting the payout.
-
-You make TWO types of decisions:
-1. OPEN new positions — when you spot probability mispricing
-2. CLOSE existing positions — ONLY when breaking news fundamentally changes the probability
+CONTEXT: You receive the goal, current open positions (for awareness — don't duplicate), and strategist directives.
 
 DECISION PRINCIPLES:
 - Every trade must serve THE GOAL. Know the target, timeline, and current progress.
@@ -196,15 +187,41 @@ DECISION PRINCIPLES:
 - Learn from recent closed trades — don't repeat mistakes
 
 OUTPUT FORMAT — respond ONLY with a JSON array:
-[
-  {"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."},
-  {"asset":"existing-market","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"Breaking news: [specific news] changed probability from X to Y"}
-]
+[{"asset":"market-slug","direction":"buy","score":80,"estimated_edge_pct":5.0,"win_probability":0.75,"rationale":"..."}]
 
-- "buy" = bet YES, "sell" = bet NO, "close" = close an EXISTING position
-- For "close": you MUST cite specific new information that changed the probability
-- Score: your confidence 0-100
-- If no action needed, return []`;
+Rules:
+- direction: "buy" or "sell" ONLY. Never "close".
+- "buy" = bet YES, "sell" = bet NO
+- score 0-100 = your confidence
+- Don't open positions in assets you already hold (check CURRENT OPEN POSITIONS)
+- If nothing looks good, return [] — don't force trades
+- Follow the strategist's focus_categories and strategy_notes`;
+
+const POSITION_REVIEW_PROMPT = `You are the Polymarket POSITION MANAGER for a goal-driven autonomous trading system.
+
+YOUR ONLY JOB: Review existing open positions and decide if any should be closed.
+
+CRITICAL — HOW POLYMARKET WORKS:
+- Polymarket positions resolve to 0 or 100 at their end date
+- "sell" positions PROFIT when the event DOESN'T happen — HOLD until resolution
+- "buy" positions PROFIT when the event DOES happen — HOLD until resolution
+- If an event resolves in 5 days and our thesis hasn't changed, HOLD. That's 5 days from collecting the payout.
+
+DECISION FRAMEWORK — only close a position if:
+1. BREAKING NEWS fundamentally changed the probability (you MUST cite the specific news/event)
+2. The event has been officially resolved or cancelled
+
+DO NOT close positions just because:
+- You're confused about the entry price
+- The market moved 1-5% (normal fluctuation)
+- The position is at breakeven (closing costs fees = guaranteed loss)
+- You're uncertain — uncertainty is not a reason to close
+- Time is passing — that's GOOD, it means we're closer to resolution and payout
+
+OUTPUT FORMAT — respond ONLY with a JSON array:
+[{"asset":"market-slug","direction":"close","score":90,"estimated_edge_pct":0,"win_probability":0,"rationale":"BREAKING NEWS: [specific news/event that changed the probability from X to Y]"}]
+
+If ALL positions should be HELD, return []. This is the CORRECT default — holding is usually right.`;
 
 const ANALYST_SYSTEM_PROMPT = `You are a senior prediction markets analyst AI. You receive a Polymarket opportunity and must decide whether to take the trade.
 
@@ -521,37 +538,69 @@ Analyze these prediction markets for mispriced events:\n\n${snapshot}`
     let opportunities: ScreenerOpportunity[] = [];
     try {
       opportunities = extractJSON<ScreenerOpportunity[]>(screenerResponse.content);
+      // Screener should only return buy/sell, filter out any close recommendations
+      opportunities = opportunities.filter((o) => o.direction !== 'close');
     } catch {
       result.errors.push('Failed to parse screener JSON response');
     }
 
-    // Separate close recommendations from new opportunities
-    const closeRecs = opportunities.filter((o) => o.direction === 'close');
-    const newOpps = opportunities.filter((o) => o.direction !== 'close' && o.score >= 30);
+    // POSITION REVIEW: Separate AI call with dedicated prompt (only if we have open positions)
+    if (openPositions.length > 0) {
+      try {
+        const reviewResponse = await callClaude(
+          SONNET,
+          POSITION_REVIEW_PROMPT + '\n' + fullContext,
+          `Review these open positions against current market data. Only recommend closing if BREAKING NEWS changed the probability.\n\nMARKET DATA:\n${snapshot}`,
+          512
+        );
 
-    // Process close recommendations — AI has full context and makes all decisions
-    for (const rec of closeRecs) {
-      const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
-      if (!matchingTrade) continue;
+        await supabase.from('ai_decisions').insert({
+          decision_type: 'analyst',
+          trader: TRADER_NAME,
+          model: SONNET,
+          prompt_tokens: reviewResponse.input_tokens,
+          completion_tokens: reviewResponse.output_tokens,
+          cost_usd: reviewResponse.cost_usd,
+          latency_ms: reviewResponse.latency_ms,
+          input_summary: { type: 'position_review', open_positions: openPositions.length },
+          output_raw: reviewResponse.content,
+        });
+        result.decisions_logged++;
 
-      const { error: closeErr } = await supabase
-        .from('trades')
-        .update({
-          status: 'closed',
-          close_reason: 'signal_reversal',
-          closed_at: new Date().toISOString(),
-        })
-        .eq('asset', rec.asset)
-        .eq('trader', 'polymarket')
-        .eq('status', 'open')
-        .limit(1);
+        let closeRecs: ScreenerOpportunity[] = [];
+        try {
+          closeRecs = extractJSON<ScreenerOpportunity[]>(reviewResponse.content);
+          closeRecs = closeRecs.filter((o) => o.direction === 'close');
+        } catch {
+          // Empty array = hold all positions (correct default)
+        }
 
-      if (!closeErr) {
-        result.errors.push(`AI closed ${rec.asset}: ${rec.rationale}`);
+        for (const rec of closeRecs) {
+          const matchingTrade = openPositions.find((t: Record<string, unknown>) => t.asset === rec.asset);
+          if (!matchingTrade) continue;
+
+          const { error: closeErr } = await supabase
+            .from('trades')
+            .update({
+              status: 'closed',
+              close_reason: 'signal_reversal',
+              closed_at: new Date().toISOString(),
+            })
+            .eq('asset', rec.asset)
+            .eq('trader', 'polymarket')
+            .eq('status', 'open')
+            .limit(1);
+
+          if (!closeErr) {
+            result.errors.push(`Position manager closed ${rec.asset}: ${rec.rationale}`);
+          }
+        }
+      } catch (err) {
+        result.errors.push(`Position review failed: ${String(err)}`);
       }
     }
 
-    const viable = newOpps;
+    const viable = opportunities.filter((o) => o.score >= 30);
     result.opportunities_found = viable.length;
 
     // 3. Deep-analyze high-scoring opportunities
