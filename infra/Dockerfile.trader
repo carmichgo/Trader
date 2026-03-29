@@ -1,0 +1,60 @@
+# --------------------------------------------------------------------------
+# Dockerfile.trader -- Configurable trader process (polymarket/crypto/stocks)
+# --------------------------------------------------------------------------
+# The TRADER_TYPE environment variable selects which trader to run.
+#
+#   docker build -f infra/Dockerfile.trader -t trader ..
+#   docker run -e TRADER_TYPE=crypto trader
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System deps for asyncpg and native extensions
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libpq-dev gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e ".[dev]" 2>/dev/null || pip install --no-cache-dir .
+
+COPY packages/ ./packages/
+COPY scripts/ ./scripts/
+COPY config.yaml ./
+
+# TRADER_TYPE must be set at runtime: polymarket | crypto | stocks
+ENV TRADER_TYPE=crypto
+ENV PYTHONUNBUFFERED=1
+
+# Entrypoint script that selects the correct trader based on TRADER_TYPE
+COPY <<'ENTRYPOINT' /app/entrypoint.sh
+#!/bin/bash
+set -e
+
+echo "Starting trader: ${TRADER_TYPE}"
+
+case "${TRADER_TYPE}" in
+    polymarket)
+        exec python -m packages.trader_polymarket
+        ;;
+    crypto)
+        exec python -m packages.trader_crypto
+        ;;
+    stocks)
+        exec python -m packages.trader_stocks
+        ;;
+    paper)
+        exec python scripts/paper_trade.py
+        ;;
+    *)
+        echo "ERROR: Unknown TRADER_TYPE='${TRADER_TYPE}'"
+        echo "Must be one of: polymarket, crypto, stocks, paper"
+        exit 1
+        ;;
+esac
+ENTRYPOINT
+
+RUN chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

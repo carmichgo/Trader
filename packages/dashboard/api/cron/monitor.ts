@@ -1,0 +1,415 @@
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { createClient } from '@supabase/supabase-js';
+
+// ── Inlined: Supabase client ──
+const supabaseUrl = process.env.STORAGE_SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+const supabaseKey = process.env.STORAGE_SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+const TRADER_NAME = 'monitor';
+
+// ── Alpaca Execution ──
+const ALPACA_BASE = 'https://paper-api.alpaca.markets';
+
+async function alpacaRequest(path: string, method = 'GET', body?: unknown) {
+  const key = process.env.ALPACA_API_KEY;
+  const secret = process.env.ALPACA_API_SECRET;
+  if (!key || !secret) return null;
+
+  const resp = await fetch(`${ALPACA_BASE}${path}`, {
+    method,
+    headers: {
+      'APCA-API-KEY-ID': key,
+      'APCA-API-SECRET-KEY': secret,
+      'Content-Type': 'application/json',
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Alpaca ${method} ${path}: ${resp.status} ${err}`);
+  }
+  return resp.json();
+}
+
+async function closeAlpacaPosition(symbol: string, isCrypto: boolean) {
+  const alpacaSymbol = isCrypto ? (symbol.includes('/') ? symbol : `${symbol}/USD`) : symbol;
+  const encoded = encodeURIComponent(alpacaSymbol);
+  return alpacaRequest(`/v2/positions/${encoded}`, 'DELETE');
+}
+
+interface AlpacaPosition {
+  symbol: string;
+  qty: string;
+  side: string;
+  market_value: string;
+  unrealized_pl: string;
+  current_price: string;
+  avg_entry_price: string;
+}
+
+async function fetchAlpacaPositions(): Promise<AlpacaPosition[]> {
+  try {
+    const positions = await alpacaRequest('/v2/positions');
+    return (positions as AlpacaPosition[]) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+interface OpenTrade {
+  id: string;
+  trader: string;
+  asset: string;
+  direction: string;
+  entry_price: number;
+  stop_loss: number;
+  take_profit: number;
+  position_size_usd: number;
+  quantity: number;
+  opened_at: string;
+}
+
+interface MonitorResult {
+  trader: string;
+  timestamp: string;
+  open_trades_checked: number;
+  trades_closed: number;
+  total_pnl: number;
+  errors: string[];
+}
+
+/**
+ * Fetch current crypto prices from CoinGecko for a list of symbols.
+ */
+async function fetchCryptoPrices(symbols: string[]): Promise<Record<string, number>> {
+  const symbolToCoinId: Record<string, string> = {
+    BTC: 'bitcoin',
+    ETH: 'ethereum',
+    SOL: 'solana',
+    AVAX: 'avalanche-2',
+    BNB: 'binancecoin',
+  };
+
+  const coinIds = symbols
+    .map((s) => symbolToCoinId[s.toUpperCase()])
+    .filter(Boolean) as string[];
+
+  if (coinIds.length === 0) return {};
+
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
+  const response = await fetch(url);
+  if (!response.ok) return {};
+
+  const data = await response.json();
+  const prices: Record<string, number> = {};
+
+  for (const symbol of symbols) {
+    const coinId = symbolToCoinId[symbol.toUpperCase()];
+    if (coinId && data[coinId]?.usd) {
+      prices[symbol.toUpperCase()] = data[coinId].usd;
+    }
+  }
+
+  return prices;
+}
+
+/**
+ * Fetch current stock prices from Yahoo Finance.
+ */
+async function fetchStockPrices(symbols: string[]): Promise<Record<string, number>> {
+  if (symbols.length === 0) return {};
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${symbols.join(',')}&range=1d&interval=1d`;
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+  });
+
+  if (!response.ok) return {};
+
+  const data = await response.json();
+  const prices: Record<string, number> = {};
+
+  for (const result of data.spark?.result ?? []) {
+    if (result?.symbol && result?.response?.[0]?.meta?.regularMarketPrice) {
+      prices[result.symbol] = result.response[0].meta.regularMarketPrice;
+    }
+  }
+
+  return prices;
+}
+
+/**
+ * Determine if a trade's stop-loss or take-profit has been hit.
+ */
+function checkTradeTargets(
+  trade: OpenTrade,
+  currentPrice: number
+): { shouldClose: boolean; reason: string; pnl: number } {
+  const isLong = trade.direction === 'buy';
+  let pnl: number;
+
+  if (isLong) {
+    pnl = (currentPrice - trade.entry_price) * trade.quantity;
+  } else {
+    // Short / sell
+    pnl = (trade.entry_price - currentPrice) * trade.quantity;
+  }
+
+  // Check stop-loss
+  if (isLong && currentPrice <= trade.stop_loss) {
+    return { shouldClose: true, reason: 'stop_loss', pnl };
+  }
+  if (!isLong && currentPrice >= trade.stop_loss) {
+    return { shouldClose: true, reason: 'stop_loss', pnl };
+  }
+
+  // Check take-profit
+  if (isLong && currentPrice >= trade.take_profit) {
+    return { shouldClose: true, reason: 'take_profit', pnl };
+  }
+  if (!isLong && currentPrice <= trade.take_profit) {
+    return { shouldClose: true, reason: 'take_profit', pnl };
+  }
+
+  return { shouldClose: false, reason: '', pnl };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const result: MonitorResult = {
+    trader: TRADER_NAME,
+    timestamp: new Date().toISOString(),
+    open_trades_checked: 0,
+    trades_closed: 0,
+    total_pnl: 0,
+    errors: [],
+  };
+
+  try {
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret) {
+      const authHeader = req.headers['authorization'];
+      if (authHeader !== `Bearer ${cronSecret}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    // 1. Fetch all open trades
+    const { data: openTrades, error: fetchError } = await supabase
+      .from('trades')
+      .select('*')
+      .eq('status', 'open');
+
+    if (fetchError) {
+      result.errors.push(`Failed to fetch open trades: ${fetchError.message}`);
+      return res.status(500).json(result);
+    }
+
+    if (!openTrades || openTrades.length === 0) {
+      return res.status(200).json({ ...result, message: 'No open trades to monitor' });
+    }
+
+    result.open_trades_checked = openTrades.length;
+
+    // 2. Group trades by type to batch price fetches
+    const cryptoSymbols = new Set<string>();
+    const stockSymbols = new Set<string>();
+    const cryptoTickers = ['BTC', 'ETH', 'SOL', 'AVAX', 'BNB'];
+
+    for (const trade of openTrades) {
+      const symbol = String(trade.asset).toUpperCase();
+      if (cryptoTickers.includes(symbol)) {
+        cryptoSymbols.add(symbol);
+      } else if (trade.trader === 'stocks') {
+        stockSymbols.add(symbol);
+      }
+      // Polymarket trades don't have real-time price feeds for monitoring
+    }
+
+    // 3. Fetch current prices
+    const [cryptoPrices, stockPrices] = await Promise.all([
+      fetchCryptoPrices(Array.from(cryptoSymbols)),
+      fetchStockPrices(Array.from(stockSymbols)),
+    ]);
+
+    const allPrices: Record<string, number> = { ...cryptoPrices, ...stockPrices };
+
+    // 4. Check each trade against stop-loss and take-profit
+    let dailyPnl = 0;
+
+    for (const trade of openTrades) {
+      const symbol = String(trade.asset).toUpperCase();
+      const currentPrice = allPrices[symbol];
+
+      // Skip if no price available (e.g., Polymarket trades)
+      if (currentPrice === undefined) continue;
+
+      const typedTrade: OpenTrade = {
+        id: trade.id,
+        trader: trade.trader,
+        asset: trade.asset,
+        direction: trade.direction,
+        entry_price: Number(trade.entry_price),
+        stop_loss: Number(trade.stop_loss),
+        take_profit: Number(trade.take_profit),
+        position_size_usd: Number(trade.position_size_usd),
+        quantity: Number(trade.quantity),
+        opened_at: trade.opened_at,
+      };
+
+      const { shouldClose, reason, pnl } = checkTradeTargets(typedTrade, currentPrice);
+
+      if (shouldClose) {
+        // Close the trade in Supabase
+        const { error: updateError } = await supabase
+          .from('trades')
+          .update({
+            status: 'closed',
+            exit_price: currentPrice,
+            pnl_usd: pnl,
+            close_reason: reason,
+            closed_at: new Date().toISOString(),
+          })
+          .eq('id', trade.id);
+
+        if (updateError) {
+          result.errors.push(`Failed to close trade ${trade.id}: ${updateError.message}`);
+        } else {
+          result.trades_closed++;
+          dailyPnl += pnl;
+
+          // Also close on Alpaca (skip polymarket trades)
+          if (typedTrade.trader !== 'polymarket') {
+            const isCrypto = cryptoTickers.includes(symbol);
+            try {
+              await closeAlpacaPosition(symbol, isCrypto);
+              result.errors.push(`Alpaca position closed: ${symbol}`);
+            } catch (err) {
+              // Position might not exist on Alpaca (paper trades from before)
+              result.errors.push(`Alpaca close skipped for ${symbol}: ${String(err)}`);
+            }
+          }
+        }
+      }
+    }
+
+    result.total_pnl = dailyPnl;
+
+    // ── Sync Alpaca positions ──
+    // Fetch what Alpaca actually holds and check for positions that were
+    // stopped out or filled on Alpaca's side (bracket order legs)
+    try {
+      const alpacaPositions = await fetchAlpacaPositions();
+      if (alpacaPositions.length > 0) {
+        result.errors.push(`Alpaca holds ${alpacaPositions.length} position(s): ${alpacaPositions.map(p => `${p.symbol} ${p.qty}@${p.current_price} PnL:$${parseFloat(p.unrealized_pl).toFixed(2)}`).join(', ')}`);
+      }
+
+      // Check for Supabase open trades that no longer exist on Alpaca
+      // (meaning Alpaca closed them via SL/TP bracket legs)
+      const alpacaSymbolSet = new Set(alpacaPositions.map(p => p.symbol));
+      for (const trade of openTrades) {
+        if (trade.trader === 'polymarket') continue;
+        const sym = String(trade.asset).toUpperCase();
+        const isCrypto = cryptoTickers.includes(sym);
+        const alpacaSym = isCrypto ? `${sym}/USD` : sym;
+
+        // If we have an open trade in Supabase but Alpaca no longer holds it,
+        // it may have been closed by a bracket leg (SL/TP hit on Alpaca)
+        if (!alpacaSymbolSet.has(alpacaSym)) {
+          // Check if this trade has an alpaca_order_id (was actually placed on Alpaca)
+          const analystOutput = trade.analyst_output;
+          let hasAlpacaOrder = false;
+          try {
+            const parsed = typeof analystOutput === 'string' ? JSON.parse(analystOutput) : analystOutput;
+            hasAlpacaOrder = !!parsed?.alpaca_order_id;
+          } catch {
+            // ignore parse errors
+          }
+
+          if (hasAlpacaOrder) {
+            // Alpaca closed this position (SL/TP hit) — update Supabase
+            const cp = allPrices[sym];
+            if (cp !== undefined) {
+              const typedT: OpenTrade = {
+                id: trade.id, trader: trade.trader, asset: trade.asset,
+                direction: trade.direction, entry_price: Number(trade.entry_price),
+                stop_loss: Number(trade.stop_loss), take_profit: Number(trade.take_profit),
+                position_size_usd: Number(trade.position_size_usd),
+                quantity: Number(trade.quantity), opened_at: trade.opened_at,
+              };
+              const closePnl = typedT.direction === 'buy'
+                ? (cp - typedT.entry_price) * typedT.quantity
+                : (typedT.entry_price - cp) * typedT.quantity;
+
+              await supabase
+                .from('trades')
+                .update({
+                  status: 'closed',
+                  exit_price: cp,
+                  pnl_usd: closePnl,
+                  close_reason: 'alpaca_closed',
+                  closed_at: new Date().toISOString(),
+                })
+                .eq('id', trade.id);
+
+              result.trades_closed++;
+              dailyPnl += closePnl;
+              result.errors.push(`Alpaca-synced close for ${sym}: PnL $${closePnl.toFixed(2)}`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      result.errors.push(`Alpaca sync failed: ${String(err)}`);
+    }
+
+    // 5. Update daily performance
+    const today = new Date().toISOString().split('T')[0];
+
+    // Fetch existing daily performance row
+    const { data: existingPerf } = await supabase
+      .from('daily_performance')
+      .select('*')
+      .eq('date', today)
+      .limit(1);
+
+    if (existingPerf && existingPerf.length > 0) {
+      const existing = existingPerf[0];
+      await supabase
+        .from('daily_performance')
+        .update({
+          total_pnl: Number(existing.total_pnl ?? 0) + dailyPnl,
+          trades_closed: Number(existing.trades_closed ?? 0) + result.trades_closed,
+        })
+        .eq('date', today);
+    } else {
+      await supabase.from('daily_performance').insert({
+        date: today,
+        total_pnl: dailyPnl,
+        trades_closed: result.trades_closed,
+        total_trades: openTrades.length,
+      });
+    }
+
+    // 6. Insert portfolio snapshot
+    const { data: latestSnapshot } = await supabase
+      .from('portfolio_snapshots')
+      .select('total_capital')
+      .order('time', { ascending: false })
+      .limit(1);
+
+    const totalCapital = (latestSnapshot?.[0]?.total_capital ?? 1000) + dailyPnl;
+
+    await supabase.from('portfolio_snapshots').insert({
+      time: new Date().toISOString(),
+      total_capital: totalCapital,
+      daily_inference_cost: 0,
+    });
+
+    return res.status(200).json(result);
+  } catch (err) {
+    result.errors.push(String(err));
+    return res.status(500).json(result);
+  }
+}

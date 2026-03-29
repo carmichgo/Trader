@@ -1,0 +1,36 @@
+# --------------------------------------------------------------------------
+# Dockerfile.api -- FastAPI backend for the AI trading system
+# --------------------------------------------------------------------------
+
+# --- Base stage -----------------------------------------------------------
+FROM python:3.12-slim AS base
+
+WORKDIR /app
+
+# System deps for asyncpg (libpq) and general build tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libpq-dev gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e ".[dev]" 2>/dev/null || pip install --no-cache-dir .
+
+COPY packages/ ./packages/
+COPY api/ ./api/
+COPY config.yaml ./
+
+# --- Dev stage (used by docker-compose.dev.yml) ---------------------------
+FROM base AS dev
+
+# Install dev dependencies
+RUN pip install --no-cache-dir watchfiles
+
+EXPOSE 8000
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+# --- Production stage -----------------------------------------------------
+FROM base AS production
+
+EXPOSE 8000
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--loop", "uvloop", "--http", "httptools"]
